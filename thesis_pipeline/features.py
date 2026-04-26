@@ -1,0 +1,850 @@
+"""Per-epoch feature extractors.
+
+Each function takes a 1-D signal + sampling frequency and returns a dict of
+1-D arrays (length ``n_epochs``). Feature dicts are merged into the epoch
+frame by ``scripts/process_batch.process_subject``.
+
+Features implemented:
+    SpO2:         mean, min, max, std, ODI 3% + 4% event counts, desat depth
+    ECG / HRV:    mean HR, SDNN, RMSSD, pNN50
+                  R-peak detection: NeuroKit2 primary, Pan-Tompkins fallback
+    EEG band power: absolute + relative δ/θ/α/σ/β, total power, spectral edge 95%
+    Respiratory:  airflow/thor/abdo RMS, thor-abdo correlation, breath rate
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from scipy import signal as sps
+
+from .epochs import EPOCH_SECONDS
+
+# Bumped whenever feature extraction logic changes. Written into every parquet
+# so downstream code can filter mixed-version cohorts cleanly.
+FEATURES_VERSION = "2026-04-26-position-v1"
+
+
+# Base columns used as inputs for contextual_features. Anything in the epoch
+# frame matching one of these gets a set of lag/lead/rolling derivatives.
+ROLLING_BASE_COLS = (
+    "spo2_mean", "spo2_min", "spo2_max", "spo2_std",
+    "odi3_count", "odi4_count", "desat_depth",
+    "hypoxic_burden_epoch",  # NEW T4 — Azarbarzin 2019 hypoxic burden
+    "hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50",
+    "hrv_lf_power", "hrv_hf_power", "hrv_lf_hf_ratio", "hrv_total_power_freq",  # NEW T3
+    "eeg_delta_power", "eeg_theta_power", "eeg_alpha_power",
+    "eeg_sigma_power", "eeg_beta_power", "eeg_total_power", "eeg_spectral_edge95",
+    "eeg_delta_rel", "eeg_theta_rel", "eeg_alpha_rel", "eeg_sigma_rel", "eeg_beta_rel",
+    "resp_airflow_rms", "resp_airflow_std", "resp_thor_rms", "resp_abdo_rms",
+    "resp_thor_abdo_corr", "resp_breath_rate_bpm",
+    "position_right_frac", "position_left_frac", "position_supine_frac",  # NEW T5
+    "position_prone_frac", "position_upright_frac",  # NEW T5
+)
+
+
+def _epoch_view(signal: np.ndarray, sfreq: float) -> np.ndarray:
+    """Reshape a 1-D signal into (n_epochs, samples_per_epoch). Drops the
+    trailing partial epoch if recording length isn't a multiple of 30 s."""
+    samples_per_epoch = int(round(EPOCH_SECONDS * sfreq))
+    n_epochs = signal.size // samples_per_epoch
+    usable = signal[: n_epochs * samples_per_epoch]
+    return usable.reshape(n_epochs, samples_per_epoch)
+
+
+def _n_epochs(signal_size: int, sfreq: float) -> int:
+    return signal_size // int(round(EPOCH_SECONDS * sfreq))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SpO2
+# ─────────────────────────────────────────────────────────────────────────
+
+# Values below this are treated as sensor artifacts (disconnected probe etc.).
+# Real clinical desaturations rarely go below 50% and 0/low values dominate
+# when the sensor loses contact.
+SPO2_MIN_VALID = 50.0
+
+
+def _rolling_max(x: np.ndarray, window: int) -> np.ndarray:
+    """Rolling max via a max filter. Window is one-sided (look back)."""
+    pad = np.full(window - 1, np.nan)
+    padded = np.concatenate([pad, x])
+    # scipy's maximum_filter1d gives centred window; approximate one-sided
+    # by using a trailing window on the padded array
+    from scipy.ndimage import maximum_filter1d
+
+    out = maximum_filter1d(padded, size=window, mode="nearest")
+    return out[window - 1 :]
+
+
+def _desaturation_events(
+    spo2_1hz: np.ndarray, threshold: float = 3.0, min_duration: int = 10
+) -> list[tuple[int, int, float]]:
+    """Find desaturation events in a 1-Hz SpO2 trace.
+
+    An event starts when SpO2 drops by ≥ ``threshold`` % from a rolling
+    100-second baseline (max of preceding 100 s) and lasts ≥ ``min_duration``
+    seconds. Returns a list of (start_sec, duration_sec, nadir_percent).
+    """
+    if spo2_1hz.size == 0:
+        return []
+    baseline = _rolling_max(spo2_1hz, window=100)
+    drop = baseline - spo2_1hz
+    is_desat = drop >= threshold
+
+    events: list[tuple[int, int, float]] = []
+    i = 0
+    n = is_desat.size
+    while i < n:
+        if is_desat[i]:
+            j = i
+            while j < n and is_desat[j]:
+                j += 1
+            if (j - i) >= min_duration:
+                nadir = float(np.nanmin(spo2_1hz[i:j]))
+                events.append((i, j - i, nadir))
+            i = j
+        else:
+            i += 1
+    return events
+
+
+def spo2_features(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
+    """Per-epoch SpO2 statistics and desaturation counts.
+
+    ``signal`` is expected in % (0–100). SHHS stores SpO2 at 125 Hz but the
+    underlying update rate is ~1 Hz (piecewise-constant). We downsample to
+    1 Hz for event detection but compute stats on the full-rate signal.
+    """
+    # mne may or may not scale — if values look like fractions (0–1), rescale
+    s = np.asarray(signal, dtype=float)
+    if np.isfinite(s).any() and np.nanmax(np.abs(s[np.isfinite(s)])) <= 2.0:
+        s = s * 100.0
+
+    # Mask artifacts: set them to NaN so stats ignore them
+    s_clean = np.where(s >= SPO2_MIN_VALID, s, np.nan)
+
+    ep = _epoch_view(s_clean, sfreq)
+    n = ep.shape[0]
+
+    with np.errstate(invalid="ignore"):
+        mean_ = np.nanmean(ep, axis=1)
+        min_ = np.nanmin(ep, axis=1)
+        max_ = np.nanmax(ep, axis=1)
+        std_ = np.nanstd(ep, axis=1)
+
+    # Downsample to 1 Hz for event detection
+    step = int(round(sfreq))
+    spo2_1hz = s_clean[::step]
+
+    odi3_per_epoch = np.zeros(n, dtype=np.int16)
+    odi4_per_epoch = np.zeros(n, dtype=np.int16)
+    deepest_desat = np.full(n, np.nan)  # max drop from baseline within epoch
+
+    for start, dur, nadir in _desaturation_events(spo2_1hz, threshold=3.0):
+        ep_idx = start // EPOCH_SECONDS
+        if 0 <= ep_idx < n:
+            odi3_per_epoch[ep_idx] += 1
+
+    for start, dur, nadir in _desaturation_events(spo2_1hz, threshold=4.0):
+        ep_idx = start // EPOCH_SECONDS
+        if 0 <= ep_idx < n:
+            odi4_per_epoch[ep_idx] += 1
+            # Track the deepest desat per epoch
+            depth = (np.nanmedian(spo2_1hz) - nadir) if np.isfinite(nadir) else np.nan
+            prev = deepest_desat[ep_idx]
+            if not np.isfinite(prev) or (np.isfinite(depth) and depth > prev):
+                deepest_desat[ep_idx] = depth
+
+    return {
+        "spo2_mean": mean_,
+        "spo2_min": min_,
+        "spo2_max": max_,
+        "spo2_std": std_,
+        "odi3_count": odi3_per_epoch.astype(np.float32),
+        "odi4_count": odi4_per_epoch.astype(np.float32),
+        "desat_depth": deepest_desat,
+    }
+
+
+def hypoxic_burden_features(
+    spo2_signal: np.ndarray,
+    sfreq: float,
+    events: list,  # list[RespiratoryEvent] from io.read_nsrr_xml
+    n_epochs: int,
+) -> dict[str, np.ndarray]:
+    """Per-epoch hypoxic burden (Azarbarzin 2019 §Methods).
+
+    Hypoxic burden quantifies the depth × duration of SpO₂ desaturations
+    associated with respiratory events. The Azarbarzin et al. 2019
+    *Eur Heart J* paper defines this as the cleanest CVD-mortality predictor
+    on SHHS+MrOS (Q5/Q1 fully-adjusted HR = 1.96 [1.11–3.43] on SHHS).
+
+    Implementation (per Azarbarzin 2019 with documented approximation):
+
+    1. **Event list**: every annotated apnoea + hypopnoea (obstructive,
+       central, mixed, hypopnea) — regardless of desaturation threshold.
+       The event list is supplied by ``read_nsrr_xml``.
+    2. **Baseline**: max SpO₂ in the 100 s **prior to event END** (NOT
+       event start — this is the documented gotcha in the paper).
+    3. **Search window** ⚠ — Azarbarzin's method uses a subject-specific
+       window derived from the average event-aligned SpO₂ trace.
+       This implementation uses a **fixed-window approximation** of
+       (-30 s before, +90 s after event end). Documented deviation;
+       cohort-level burden distributions remain interpretable but absolute
+       values won't exactly match published Azarbarzin values.
+    4. **Burden = AUC of (baseline − SpO₂)** over the search window where
+       the deficit is positive. At 1 Hz integration, the AUC numerically
+       equals sum of deficits in %·s.
+    5. **Per-epoch attribution**: each event's burden is added to the
+       epoch index containing the event END (= ev.start_sec + ev.duration_sec
+       // EPOCH_SECONDS). An epoch can accumulate burden from multiple
+       events.
+
+    Parameters
+    ----------
+    spo2_signal : np.ndarray
+        SpO₂ signal at the EDF native rate (typically 125 Hz, but
+        underlying is ~1 Hz so we downsample to 1 Hz internally).
+    sfreq : float
+        EDF native sampling rate of ``spo2_signal``.
+    events : list[RespiratoryEvent]
+        Annotated respiratory events from ``read_nsrr_xml``. Filtered
+        internally to apnoeas + hypopnoeas.
+    n_epochs : int
+        Number of 30-s epochs in the recording.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        Single column ``hypoxic_burden_epoch`` of length ``n_epochs``
+        (units: %·s).
+
+    Reference
+    ---------
+    Azarbarzin A et al. 2019. "The hypoxic burden of sleep apnoea
+    predicts cardiovascular disease-related mortality: the Osteoporotic
+    Fractures in Men Study and the Sleep Heart Health Study."
+    Eur Heart J 40(14):1149–1157. DOI 10.1093/eurheartj/ehy624.
+    """
+    # Downsample SpO₂ to 1 Hz (mirrors the convention in spo2_features)
+    s = np.asarray(spo2_signal, dtype=float)
+    if np.isfinite(s).any() and np.nanmax(np.abs(s[np.isfinite(s)])) <= 2.0:
+        s = s * 100.0
+    s_clean = np.where(s >= SPO2_MIN_VALID, s, np.nan)
+    step = max(1, int(round(sfreq)))
+    spo2_1hz = s_clean[::step]
+    n_samples_1hz = spo2_1hz.size
+
+    burden = np.zeros(n_epochs, dtype=np.float32)
+    if n_samples_1hz == 0 or not events:
+        return {"hypoxic_burden_epoch": burden}
+
+    # Constants (per Azarbarzin 2019 §Methods)
+    BASELINE_WINDOW_SEC = 100  # max SpO₂ in 100 s before event END
+    SEARCH_LO_SEC = 30  # 30 s before event end
+    SEARCH_HI_SEC = 90  # 90 s after event end (-30, +90 fixed approximation)
+
+    APNOEA_EVENT_KINDS = {
+        "Obstructive Apnea",
+        "Central Apnea",
+        "Mixed Apnea",
+        "Hypopnea",
+        "Obstructive apnea",
+        "Central apnea",
+        "Mixed apnea",
+    }
+
+    for ev in events:
+        if ev.kind not in APNOEA_EVENT_KINDS:
+            continue
+        ev_end_sec = float(ev.start_sec + ev.duration_sec)
+        ev_end_idx = int(round(ev_end_sec))
+        if ev_end_idx <= 0 or ev_end_idx > n_samples_1hz:
+            continue
+
+        # Baseline: max SpO₂ in 100 s prior to event END
+        baseline_lo = max(0, ev_end_idx - BASELINE_WINDOW_SEC)
+        if baseline_lo >= ev_end_idx:
+            continue
+        baseline_segment = spo2_1hz[baseline_lo:ev_end_idx]
+        with np.errstate(invalid="ignore"):
+            baseline = float(np.nanmax(baseline_segment))
+        if not np.isfinite(baseline):
+            continue
+
+        # Search window: -30 s to +90 s around event END (approximation)
+        sw_lo = max(0, ev_end_idx - SEARCH_LO_SEC)
+        sw_hi = min(n_samples_1hz, ev_end_idx + SEARCH_HI_SEC)
+        if sw_hi <= sw_lo:
+            continue
+        spo2_seg = spo2_1hz[sw_lo:sw_hi]
+        # AUC of positive deficit at 1 Hz
+        with np.errstate(invalid="ignore"):
+            deficit = np.clip(baseline - spo2_seg, 0.0, None)
+        auc = float(np.nansum(deficit))  # units: %·s
+
+        # Attribute the AUC to the epoch containing the event END
+        ep_idx = ev_end_idx // EPOCH_SECONDS
+        if 0 <= ep_idx < n_epochs:
+            burden[ep_idx] += auc
+
+    return {"hypoxic_burden_epoch": burden}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ECG / HRV
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _r_peaks_pantompkins(ecg: np.ndarray, sfreq: float) -> np.ndarray:
+    """Legacy R-peak detector (Pan–Tompkins 1985 style).
+
+    Bandpass 5–15 Hz → differentiate → square → moving-average envelope →
+    adaptive-threshold peak finding. Kept as a fallback for subjects where
+    NeuroKit2 fails.
+    """
+    ecg = np.asarray(ecg, dtype=float)
+    finite = np.isfinite(ecg)
+    if not finite.all():
+        ecg = np.where(finite, ecg, np.nanmedian(ecg[finite]) if finite.any() else 0.0)
+
+    nyq = sfreq / 2.0
+    low, high = 5.0 / nyq, 15.0 / nyq
+    if not (0 < low < high < 1):
+        return np.array([], dtype=int)
+    sos = sps.butter(4, [low, high], btype="band", output="sos")
+    filt = sps.sosfiltfilt(sos, ecg)
+    diff = np.diff(filt, prepend=filt[0])
+    squared = diff * diff
+    win = max(3, int(0.15 * sfreq))
+    envelope = np.convolve(squared, np.ones(win) / win, mode="same")
+
+    thresh = np.percentile(envelope, 90) * 0.3
+    min_dist = max(1, int(0.2 * sfreq))
+    peaks, _ = sps.find_peaks(envelope, distance=min_dist, height=thresh)
+    return peaks
+
+
+def _r_peaks_neurokit(ecg: np.ndarray, sfreq: float) -> np.ndarray:
+    """R-peak detector using NeuroKit2's default hybrid method.
+
+    NeuroKit2's ``ecg_peaks(method='neurokit')`` pipeline: clean signal
+    (bandpass + powerline filter) → QRS detection via the neurokit2-native
+    hybrid that chains Engelse–Zeelenberg + custom refinement. Published
+    benchmarks (Makowski et al. 2021) show it outperforms Pan–Tompkins on
+    noisy clinical ECG, which matches the apnoea subjects in SHHS.
+    """
+    import neurokit2 as nk  # deferred import — heavy
+
+    ecg = np.asarray(ecg, dtype=float)
+    finite = np.isfinite(ecg)
+    if not finite.any():
+        return np.array([], dtype=int)
+    if not finite.all():
+        ecg = np.where(finite, ecg, float(np.nanmedian(ecg[finite])))
+
+    _, info = nk.ecg_peaks(ecg, sampling_rate=int(sfreq), method="neurokit")
+    peaks = np.asarray(info.get("ECG_R_Peaks", []), dtype=int)
+    return peaks
+
+
+def r_peaks(ecg: np.ndarray, sfreq: float) -> np.ndarray:
+    """Detect R-peak sample indices. Primary: NeuroKit2 hybrid. Fallback: Pan–Tompkins.
+
+    The fallback triggers if NeuroKit2 errors out (rare — happens on
+    pathological signals or size mismatches) or returns fewer than 3 peaks
+    on a signal we'd expect to have hundreds. Logged via a warning-free
+    exception swallow; callers handle NaN-on-insufficient-peaks downstream.
+    """
+    try:
+        peaks = _r_peaks_neurokit(ecg, sfreq)
+        # Plausibility: for an 8-hour ECG at 60-80 bpm we expect ~30,000 peaks
+        min_expected = max(10, int(ecg.size / sfreq / 2.5))  # HR floor ~24 bpm
+        if peaks.size >= min_expected:
+            return peaks
+    except Exception:
+        pass
+    return _r_peaks_pantompkins(ecg, sfreq)
+
+
+def _robust_rr(rr_ms: np.ndarray) -> np.ndarray:
+    """de Chazal 2003 §III.C two-heuristic Robust-RR correction.
+
+    Returns a corrected RR-interval array. Two passes:
+      (1) Spurious-merge: any RR < 0.5× local-median is treated as a
+          spurious detection — dropped and combined with the next RR.
+      (2) Missed-subdivide: any RR ≥ 1.8× local-median is treated as
+          one or more missed beats — subdivided into round(RR / median)
+          equal intervals.
+    Local-median is computed over a centred 5-beat window. Output length
+    differs from input length by the net effect of merges and subdivides.
+
+    Reference:
+        de Chazal et al. 2003, "Automated processing of the single-lead
+        electrocardiogram for the detection of obstructive sleep apnoea",
+        IEEE Trans. Biomed. Eng. 50(6):686–696, §III.C.
+
+    Parameters
+    ----------
+    rr_ms : np.ndarray
+        RR intervals in milliseconds (length N).
+
+    Returns
+    -------
+    np.ndarray
+        Corrected RR intervals in milliseconds (length may differ from N).
+    """
+    if rr_ms.size < 3:
+        return rr_ms
+    rr_in = np.asarray(rr_ms, dtype=float)
+    # Centred 5-beat local median (handles boundary by truncated window)
+    local_med = np.empty_like(rr_in)
+    for i in range(rr_in.size):
+        lo, hi = max(0, i - 2), min(rr_in.size, i + 3)
+        local_med[i] = float(np.median(rr_in[lo:hi]))
+    # Single forward pass that applies both heuristics in order
+    out: list[float] = []
+    skip_next = False
+    for i, rr in enumerate(rr_in):
+        if skip_next:
+            skip_next = False
+            continue
+        med_i = local_med[i] if local_med[i] > 0 else 1.0
+        ratio = rr / med_i
+        if ratio < 0.5 and i + 1 < rr_in.size:
+            # Spurious — merge with next interval
+            out.append(rr + rr_in[i + 1])
+            skip_next = True
+        elif ratio >= 1.8:
+            # Missed beat(s) — subdivide into N equal intervals
+            n_sub = max(2, int(round(ratio)))
+            sub = rr / n_sub
+            out.extend([sub] * n_sub)
+        else:
+            out.append(rr)
+    return np.asarray(out, dtype=float)
+
+
+def hrv_features(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
+    """Per-epoch HRV: mean HR (bpm), SDNN (ms), RMSSD (ms), pNN50.
+
+    RR intervals outside [300, 2000] ms are rejected as artefacts before
+    aggregation.
+    """
+    n_epochs = _n_epochs(ecg.size, sfreq)
+    nan_out = {
+        k: np.full(n_epochs, np.nan)
+        for k in ("hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50")
+    }
+
+    peaks = r_peaks(ecg, sfreq)
+    if peaks.size < 3:
+        return nan_out
+
+    rr_sec = np.diff(peaks) / sfreq
+    rr_ms = rr_sec * 1000.0
+    # de Chazal 2003 §III.C Robust-RR: spurious-merge + missed-subdivide
+    rr_ms = _robust_rr(rr_ms)
+    # Physiological range: 40–150 bpm
+    valid = (rr_ms >= 400.0) & (rr_ms <= 1500.0)
+    # Lightweight ratio check on corrected RRs (now strict; missed beats
+    # have already been subdivided so legitimate jumps should be rare)
+    with np.errstate(invalid="ignore"):
+        ratio = np.concatenate(
+            [[1.0], rr_ms[1:] / np.clip(rr_ms[:-1], 1e-6, None)]
+        )
+    valid &= (ratio > 0.6) & (ratio < 1.6)  # widened slightly post Robust-RR
+    # Time-index each RR by its later beat. Cumulative time of corrected RRs
+    # starts from the first detected R-peak (peaks[0]).
+    cumulative_sec = peaks[0] / sfreq + np.cumsum(rr_ms / 1000.0)
+    rr_epoch = (cumulative_sec // EPOCH_SECONDS).astype(int)
+
+    hr_mean = np.full(n_epochs, np.nan)
+    sdnn = np.full(n_epochs, np.nan)
+    rmssd = np.full(n_epochs, np.nan)
+    pnn50 = np.full(n_epochs, np.nan)
+
+    for i in range(n_epochs):
+        mask = valid & (rr_epoch == i)
+        if mask.sum() < 3:
+            continue
+        epoch_rr = rr_ms[mask]
+        hr_mean[i] = 60000.0 / epoch_rr.mean()
+        sdnn[i] = epoch_rr.std(ddof=1)
+        diffs = np.diff(epoch_rr)
+        if diffs.size > 0:
+            rmssd[i] = float(np.sqrt(np.mean(diffs * diffs)))
+            pnn50[i] = float((np.abs(diffs) > 50.0).mean())
+
+    return {
+        "hr_mean": hr_mean,
+        "hrv_sdnn": sdnn,
+        "hrv_rmssd": rmssd,
+        "hrv_pnn50": pnn50,
+    }
+
+
+def hrv_freq_features(
+    ecg: np.ndarray,
+    sfreq: float,
+    window_sec: int = 120,
+    min_peaks: int = 8,
+) -> dict[str, np.ndarray]:
+    """Per-epoch frequency-domain HRV (LF, HF, LF/HF ratio, total power).
+
+    Uses NeuroKit2's ``nk.hrv_frequency()`` (Pelidisi et al. 2022,
+    *Frontiers in Neuroscience*) which implements Task Force ESC/NASPE 1996
+    standards for HRV spectral analysis.
+
+    A ``window_sec``-second sliding window centred on each 30-s epoch is fed
+    to ``nk.hrv_frequency`` per epoch. Default 120 s = 2 min satisfies the
+    NeuroKit2 / Task Force recommended minima for both LF (≥ 2 min) and
+    HF (≥ 1 min). LF/HF ratio strictly recommends ≥ 5 min, so the per-epoch
+    LF/HF here is at the lower end of the recommended range — a known
+    trade-off when reporting per-epoch resolution; cohort-level distributions
+    remain interpretable (see post-T8 validation in the Sprint 1 plan).
+
+    Pipeline (per epoch):
+        1. Locate R-peaks within ``[centre - window/2, centre + window/2]``.
+        2. If ≥ ``min_peaks`` peaks: pass to ``nk.hrv_frequency`` (Welch PSD).
+        3. Integrate over LF (0.04–0.15 Hz), HF (0.15–0.4 Hz), total (0.04–0.4 Hz).
+        4. Otherwise: NaN for that epoch.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        4 columns of length ``n_epochs``:
+            hrv_lf_power           ms² · Hz⁻¹ in LF band
+            hrv_hf_power           ms² · Hz⁻¹ in HF band
+            hrv_lf_hf_ratio        dimensionless
+            hrv_total_power_freq   ms² · Hz⁻¹, 0.04–0.4 Hz
+
+    Reference
+    ---------
+    Pelidisi N et al. 2022. "Comprehensive HRV estimation pipeline in Python
+    using Neurokit2." Frontiers in Neuroscience. PMID 35880142.
+    """
+    import neurokit2 as nk
+
+    n_epochs = _n_epochs(ecg.size, sfreq)
+    nan_out = {
+        k: np.full(n_epochs, np.nan, dtype=np.float32)
+        for k in (
+            "hrv_lf_power",
+            "hrv_hf_power",
+            "hrv_lf_hf_ratio",
+            "hrv_total_power_freq",
+        )
+    }
+
+    peaks = r_peaks(ecg, sfreq)
+    if peaks.size < min_peaks:
+        return nan_out
+
+    half_window = window_sec / 2.0
+    peak_times_sec = peaks / sfreq
+    epoch_centres = np.arange(n_epochs) * EPOCH_SECONDS + EPOCH_SECONDS / 2.0
+
+    out = {k: np.full(n_epochs, np.nan, dtype=np.float32) for k in nan_out}
+
+    for i, centre in enumerate(epoch_centres):
+        lo, hi = centre - half_window, centre + half_window
+        mask = (peak_times_sec >= lo) & (peak_times_sec <= hi)
+        if int(mask.sum()) < min_peaks:
+            continue
+        window_peaks = peaks[mask]
+        try:
+            results = nk.hrv_frequency(
+                {"ECG_R_Peaks": window_peaks},
+                sampling_rate=int(sfreq),
+                psd_method="welch",
+                show=False,
+                silent=True,
+            )
+            lf = float(results["HRV_LF"].iloc[0]) if "HRV_LF" in results.columns else np.nan
+            hf = float(results["HRV_HF"].iloc[0]) if "HRV_HF" in results.columns else np.nan
+            tp = (
+                float(results["HRV_TP"].iloc[0])
+                if "HRV_TP" in results.columns
+                else (lf + hf if np.isfinite(lf) and np.isfinite(hf) else np.nan)
+            )
+            out["hrv_lf_power"][i] = lf
+            out["hrv_hf_power"][i] = hf
+            out["hrv_total_power_freq"][i] = tp
+            if np.isfinite(lf) and np.isfinite(hf) and hf > 0:
+                out["hrv_lf_hf_ratio"][i] = lf / hf
+        except Exception:
+            # NeuroKit2 occasionally fails on pathological windows; leave NaN.
+            continue
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# EEG spectral
+# ─────────────────────────────────────────────────────────────────────────
+
+EEG_BANDS = {
+    "delta": (0.5, 4.0),
+    "theta": (4.0, 8.0),
+    "alpha": (8.0, 12.0),
+    "sigma": (12.0, 16.0),
+    "beta": (16.0, 30.0),
+}
+
+
+def eeg_band_power(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
+    """Per-epoch absolute + relative EEG band powers via Welch PSD.
+
+    Pipeline:
+        * Bandpass 0.3–35 Hz to trim DC drift and line noise
+        * Welch PSD per epoch, 4-second segments
+        * Integrate PSD over canonical bands
+        * Total power (0.5–30 Hz) and per-band relative power
+    Returns ``eeg_<band>_power`` and ``eeg_<band>_rel`` for each band, plus
+    ``eeg_total_power`` and ``eeg_spectral_edge95`` (frequency below which
+    95% of total power lies).
+    """
+    sig = np.asarray(signal, dtype=float)
+    finite = np.isfinite(sig)
+    if not finite.all():
+        sig = np.where(finite, sig, np.nanmedian(sig[finite]) if finite.any() else 0.0)
+
+    nyq = sfreq / 2.0
+    lo, hi = 0.3 / nyq, 35.0 / nyq
+    if 0 < lo < hi < 1:
+        sos = sps.butter(4, [lo, hi], btype="band", output="sos")
+        sig = sps.sosfiltfilt(sos, sig)
+
+    ep = _epoch_view(sig, sfreq)
+    n_epochs = ep.shape[0]
+    nperseg = int(4 * sfreq)
+
+    bands_keys = list(EEG_BANDS.keys())
+    out: dict[str, np.ndarray] = {
+        **{f"eeg_{b}_power": np.full(n_epochs, np.nan) for b in bands_keys},
+        "eeg_total_power": np.full(n_epochs, np.nan),
+        "eeg_spectral_edge95": np.full(n_epochs, np.nan),
+    }
+
+    for i in range(n_epochs):
+        freqs, psd = sps.welch(ep[i], fs=sfreq, nperseg=nperseg)
+        in_range = (freqs >= 0.5) & (freqs <= 30.0)
+        total = np.trapezoid(psd[in_range], freqs[in_range])
+        out["eeg_total_power"][i] = total
+        for b, (flo, fhi) in EEG_BANDS.items():
+            mask = (freqs >= flo) & (freqs < fhi)
+            out[f"eeg_{b}_power"][i] = np.trapezoid(psd[mask], freqs[mask])
+        # Spectral edge 95%
+        if total > 0:
+            cumul = np.cumsum(psd[in_range]) * (freqs[1] - freqs[0])
+            edge_idx = np.searchsorted(cumul, 0.95 * total)
+            if 0 <= edge_idx < np.sum(in_range):
+                out["eeg_spectral_edge95"][i] = freqs[in_range][edge_idx]
+
+    # Relative powers (avoid divide-by-zero)
+    total = out["eeg_total_power"]
+    safe = np.where(total > 1e-20, total, np.nan)
+    for b in bands_keys:
+        out[f"eeg_{b}_rel"] = out[f"eeg_{b}_power"] / safe
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Respiratory effort
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _bandpass(signal: np.ndarray, sfreq: float, lo: float, hi: float) -> np.ndarray:
+    nyq = sfreq / 2.0
+    if not (0 < lo / nyq < hi / nyq < 1):
+        return signal
+    sos = sps.butter(4, [lo / nyq, hi / nyq], btype="band", output="sos")
+    return sps.sosfiltfilt(sos, signal)
+
+
+def _breath_rate_per_epoch(signal: np.ndarray, sfreq: float) -> np.ndarray:
+    """Dominant respiratory frequency per epoch, via FFT peak in 0.1–0.5 Hz."""
+    ep = _epoch_view(signal, sfreq)
+    n = ep.shape[0]
+    out = np.full(n, np.nan)
+    for i in range(n):
+        x = ep[i] - ep[i].mean()
+        if np.allclose(x, 0):
+            continue
+        freqs = np.fft.rfftfreq(x.size, 1.0 / sfreq)
+        mag = np.abs(np.fft.rfft(x))
+        mask = (freqs >= 0.1) & (freqs <= 0.5)
+        if mask.any():
+            peak = mag[mask].argmax()
+            out[i] = freqs[mask][peak] * 60.0  # breaths per minute
+    return out
+
+
+def respiratory_features(
+    thor: np.ndarray | None,
+    abdo: np.ndarray | None,
+    airflow: np.ndarray | None,
+    sfreq: float,
+) -> dict[str, np.ndarray]:
+    """Per-epoch respiratory effort + airflow summaries.
+
+    Emitted columns (NaN where the channel is missing):
+        resp_airflow_rms      amplitude of airflow in respiratory band
+        resp_airflow_std      variability within epoch
+        resp_thor_rms         thoracic belt amplitude
+        resp_abdo_rms         abdominal belt amplitude
+        resp_thor_abdo_corr   Pearson correlation per epoch (drops on paradox)
+        resp_breath_rate_bpm  dominant respiratory frequency (FFT peak, 0.1–0.5 Hz)
+    """
+    # Use any available channel to size the output
+    template = next((s for s in (thor, abdo, airflow) if s is not None), None)
+    if template is None:
+        return {}
+    n = _n_epochs(template.size, sfreq)
+
+    out: dict[str, np.ndarray] = {
+        k: np.full(n, np.nan)
+        for k in (
+            "resp_airflow_rms",
+            "resp_airflow_std",
+            "resp_thor_rms",
+            "resp_abdo_rms",
+            "resp_thor_abdo_corr",
+            "resp_breath_rate_bpm",
+        )
+    }
+
+    if airflow is not None:
+        af = _bandpass(np.asarray(airflow, dtype=float), sfreq, 0.05, 3.0)
+        ep = _epoch_view(af, sfreq)
+        out["resp_airflow_rms"] = np.sqrt((ep * ep).mean(axis=1))
+        out["resp_airflow_std"] = ep.std(axis=1)
+        out["resp_breath_rate_bpm"] = _breath_rate_per_epoch(af, sfreq)
+
+    if thor is not None:
+        th = _bandpass(np.asarray(thor, dtype=float), sfreq, 0.05, 3.0)
+        ep = _epoch_view(th, sfreq)
+        out["resp_thor_rms"] = np.sqrt((ep * ep).mean(axis=1))
+
+    if abdo is not None:
+        ab = _bandpass(np.asarray(abdo, dtype=float), sfreq, 0.05, 3.0)
+        ep = _epoch_view(ab, sfreq)
+        out["resp_abdo_rms"] = np.sqrt((ep * ep).mean(axis=1))
+
+    if thor is not None and abdo is not None:
+        th_ep = _epoch_view(_bandpass(np.asarray(thor, dtype=float), sfreq, 0.05, 3.0), sfreq)
+        ab_ep = _epoch_view(_bandpass(np.asarray(abdo, dtype=float), sfreq, 0.05, 3.0), sfreq)
+        corr = np.full(n, np.nan)
+        for i in range(min(th_ep.shape[0], ab_ep.shape[0])):
+            a, b = th_ep[i], ab_ep[i]
+            a_std, b_std = a.std(), b.std()
+            if a_std > 1e-12 and b_std > 1e-12:
+                corr[i] = float(np.mean((a - a.mean()) * (b - b.mean())) / (a_std * b_std))
+        out["resp_thor_abdo_corr"] = corr
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Body position
+# ─────────────────────────────────────────────────────────────────────────
+
+
+# SHHS Compumedics POSITION channel encoding (per SHHS Manual of Operations).
+# Verified against shhs1-200001 in T5 of Sprint 1 (2026-04-26).
+POSITION_CODES = {
+    0: "right",
+    1: "left",
+    2: "supine",
+    3: "prone",
+    4: "upright",
+}
+
+
+def position_features(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
+    """Per-epoch body-position fractions.
+
+    Body position is a strong AHI modifier — supine apnoea is a well-
+    documented clinical phenomenon. Per-epoch position fractions allow
+    downstream features to capture supine-OSA stratification.
+
+    SHHS Compumedics POSITION channel encoding:
+        0 = Right, 1 = Left, 2 = Back/Supine, 3 = Front/Prone, 4 = Up/Sit
+    Verified at run time from shhs1-200001 (Sprint 1 T5, 2026-04-26).
+
+    Returns one column per position code with the fraction of samples in
+    that position per epoch. Plus a ``position_supine_frac`` alias-pointer
+    explicitly named for the AHI-relevant aggregate.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        POSITION signal at the EDF native rate (typically 125 Hz; piecewise-
+        constant since position changes slowly).
+    sfreq : float
+        EDF native sampling rate.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        5 columns of length ``n_epochs``:
+            position_right_frac, position_left_frac, position_supine_frac,
+            position_prone_frac, position_upright_frac
+    """
+    sig = np.asarray(signal, dtype=float)
+    finite = np.isfinite(sig)
+    # Round to integer code; NaN samples become -1 sentinel
+    sig_int = np.where(finite, np.round(sig).astype(int), -1)
+    ep = _epoch_view(sig_int.astype(float), sfreq)
+
+    out: dict[str, np.ndarray] = {}
+    for code, name in POSITION_CODES.items():
+        out[f"position_{name}_frac"] = (ep == code).mean(axis=1).astype(np.float32)
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Contextual / temporal features
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def contextual_features(
+    frame: pd.DataFrame, cols: tuple[str, ...] | None = None
+) -> pd.DataFrame:
+    """Add lag/lead/rolling-window aggregates for each base feature column.
+
+    For every column in ``cols`` (default = ``ROLLING_BASE_COLS`` intersected
+    with the frame's columns), append:
+
+      <col>_lag1          previous epoch's value          (NaN at first epoch)
+      <col>_lead1         next epoch's value              (NaN at last epoch)
+      <col>_roll5_mean    centered 5-epoch (2.5 min) mean
+      <col>_roll5_std     centered 5-epoch (2.5 min) std
+      <col>_roll11_mean   centered 11-epoch (5.5 min) mean
+      <col>_roll11_std    centered 11-epoch (5.5 min) std
+
+    Per-subject computation; never crosses subject boundaries (the function
+    is called once per subject's epoch frame).
+    """
+    if cols is None:
+        cols = tuple(c for c in ROLLING_BASE_COLS if c in frame.columns)
+    if not cols:
+        return frame
+
+    new_cols: dict[str, pd.Series] = {}
+    for c in cols:
+        s = frame[c]
+        new_cols[f"{c}_lag1"] = s.shift(1)
+        new_cols[f"{c}_lead1"] = s.shift(-1)
+        roll5 = s.rolling(window=5, center=True, min_periods=1)
+        new_cols[f"{c}_roll5_mean"] = roll5.mean()
+        new_cols[f"{c}_roll5_std"] = roll5.std()
+        roll11 = s.rolling(window=11, center=True, min_periods=1)
+        new_cols[f"{c}_roll11_mean"] = roll11.mean()
+        new_cols[f"{c}_roll11_std"] = roll11.std()
+
+    return pd.concat([frame, pd.DataFrame(new_cols, index=frame.index)], axis=1)

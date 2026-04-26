@@ -1,0 +1,79 @@
+# =============================================================================
+# Thesis pipeline — .gitignore
+# =============================================================================
+# Rule of thumb: never commit raw or derived NSRR/SHHS data, model artifacts,
+# or PDFs. Source code, configs, and lightweight metadata only.
+# =============================================================================
+
+# ---- NSRR / SHHS data (DUA-protected — NEVER commit) ------------------------
+# Per-subject derived features (have sleep stage / apnoea labels).
+features/
+*.parquet
+*.h5
+*.hdf5
+*.feather
+
+# Raw signal files.
+*.edf
+*.edf.gz
+*.xml
+!*-pyproject.xml  # safety hatch in case of unrelated XML configs
+
+# ---- Trained models / experiments -------------------------------------------
+models/
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.joblib
+*.txt.gz
+optuna_*.db
+*.optuna
+study.pkl
+
+# ---- Python build / cache ---------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Virtual environments ---------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ---- IDE / editor -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- Notebooks --------------------------------------------------------------
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# ---- Logs / scratch ---------------------------------------------------------
+*.log
+logs/
+scratch/
+tmp/
+*.tmp
+
+# ---- PDFs (publisher copyright) ---------------------------------------------
+*.pdf
+
+# ---- OS metadata ------------------------------------------------------------
+Thumbs.db
+Desktop.ini
