@@ -58,6 +58,7 @@ CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
 from thesis_pipeline.epochs import wake_mask  # noqa: E402
+from thesis_pipeline.extended_metrics import write_extended_metrics  # noqa: E402
 from thesis_pipeline.feature_groups import feature_subset, split_features  # noqa: E402
 
 FEATURES_DIR = CODE_ROOT / "features"
@@ -250,16 +251,25 @@ def fit_one_config(
     print(f"  AUC-PR subject CI: [{ci['aupr_ci_low']:.4f}, {ci['aupr_ci_high']:.4f}]")
 
     # Save
-    pd.DataFrame({
+    test_pred_df = pd.DataFrame({
         "subject_id": df.iloc[test_idx]["subject_id"].values,
         "epoch_idx": df.iloc[test_idx]["epoch_idx"].values,
         "apnoea_label": y[test_idx],
         "pred_prob": probs,
         "pred_label": preds,
-    }).to_parquet(out_dir / "test_predictions.parquet", index=False)
+    })
+    test_pred_df.to_parquet(out_dir / "test_predictions.parquet", index=False)
     np.save(out_dir / "bootstrap_aucs_subject.npy", aucs)
     np.save(out_dir / "bootstrap_auprs_subject.npy", auprs)
     (out_dir / "feature_list.json").write_text(json.dumps(feature_cols, indent=2))
+
+    # Extended metrics (Aim 2 standard set — calibration, clinical AHI, severity κ)
+    try:
+        sm_path = FEATURES_DIR / "subject_metadata.parquet"
+        sm = pd.read_parquet(sm_path) if sm_path.exists() else None
+        write_extended_metrics(out_dir, test_pred_df, subject_metadata=sm)
+    except Exception as _e:
+        print(f"  ! extended metrics failed: {_e}")
 
     metrics = {
         "name": name,

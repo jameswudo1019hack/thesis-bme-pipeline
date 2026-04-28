@@ -65,6 +65,7 @@ CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
 from thesis_pipeline.epochs import wake_mask  # noqa: E402
+from thesis_pipeline.extended_metrics import write_extended_metrics  # noqa: E402
 from thesis_pipeline.literature_baselines import (  # noqa: E402
     LIT_2019_BASE_FEATURES,
     lit_2019_missing,
@@ -266,13 +267,14 @@ def main(features_version: str, seed: int) -> None:
     print(f"  AUC-PR subject CI: [{ci['aupr_ci_low']:.4f}, {ci['aupr_ci_high']:.4f}]")
 
     # Persist
-    pd.DataFrame({
+    test_pred_df = pd.DataFrame({
         "subject_id": df.iloc[test_idx]["subject_id"].values,
         "epoch_idx": df.iloc[test_idx]["epoch_idx"].values,
         "apnoea_label": y[test_idx],
         "pred_prob": probs,
         "pred_label": preds,
-    }).to_parquet(OUT_DIR / "test_predictions.parquet", index=False)
+    })
+    test_pred_df.to_parquet(OUT_DIR / "test_predictions.parquet", index=False)
     np.save(OUT_DIR / "bootstrap_aucs_subject.npy", aucs)
     np.save(OUT_DIR / "bootstrap_auprs_subject.npy", auprs)
     (OUT_DIR / "feature_list.json").write_text(json.dumps({
@@ -280,6 +282,14 @@ def main(features_version: str, seed: int) -> None:
         "used": lit_features,
         "missing_from_schema": missing,
     }, indent=2))
+
+    # Extended metrics (Aim 2 standard set)
+    try:
+        sm_path = FEATURES_DIR / "subject_metadata.parquet"
+        sm = pd.read_parquet(sm_path) if sm_path.exists() else None
+        write_extended_metrics(OUT_DIR, test_pred_df, subject_metadata=sm)
+    except Exception as _e:
+        print(f"  ! extended metrics failed: {_e}")
 
     metrics = {
         "name": "lit_2019",
