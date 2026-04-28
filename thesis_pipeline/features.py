@@ -35,6 +35,7 @@ ROLLING_BASE_COLS = (
     "hypoxic_burden_epoch",  # NEW T4 — Azarbarzin 2019 hypoxic burden
     "hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50",
     "hrv_sampen",  # Phase 1 Exp 1 — sample entropy on per-epoch RR intervals
+    "cpc_amp_cv", "cpc_amp_iqr",  # Phase 1 Exp 3 — CPC-proxy via R-peak amplitude variability
     "hrv_lf_power", "hrv_hf_power", "hrv_lf_hf_ratio", "hrv_total_power_freq",  # NEW T3
     "eeg_delta_power", "eeg_theta_power", "eeg_alpha_power",
     "eeg_sigma_power", "eeg_beta_power", "eeg_total_power", "eeg_spectral_edge95",
@@ -739,7 +740,10 @@ def hrv_features(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
     n_epochs = _n_epochs(ecg.size, sfreq)
     nan_out = {
         k: np.full(n_epochs, np.nan)
-        for k in ("hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50", "hrv_sampen")
+        for k in (
+            "hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50", "hrv_sampen",
+            "cpc_amp_cv", "cpc_amp_iqr",  # Phase 1 Exp 3
+        )
     }
 
     peaks = r_peaks(ecg, sfreq)
@@ -769,6 +773,15 @@ def hrv_features(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
     rmssd = np.full(n_epochs, np.nan)
     pnn50 = np.full(n_epochs, np.nan)
     sampen = np.full(n_epochs, np.nan)  # Phase 1 Exp 1
+    cpc_amp_cv = np.full(n_epochs, np.nan)   # Phase 1 Exp 3 — R-peak amplitude CV
+    cpc_amp_iqr = np.full(n_epochs, np.nan)  # Phase 1 Exp 3 — robust amplitude variability
+
+    # Pre-compute R-peak amplitudes (raw ECG values at peak indices) and their epoch assignment.
+    # NOTE: amplitudes are aligned to the original `peaks` array, NOT to robust-RR-corrected
+    # `rr_ms` (whose length differs after merge/subdivide). For per-epoch amplitude statistics
+    # we use peaks directly — robust-RR correction affects rate/timing, not waveform amplitude.
+    peak_amplitudes = ecg[peaks].astype(float)
+    peak_epoch = (peaks // (sfreq * EPOCH_SECONDS)).astype(int)
 
     for i in range(n_epochs):
         mask = valid & (rr_epoch == i)
@@ -786,12 +799,35 @@ def hrv_features(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
         if epoch_rr.size >= 4:
             sampen[i] = _sample_entropy(epoch_rr, m=2)
 
+        # Phase 1 Exp 3 — CPC-proxy via R-peak amplitude variability.
+        # Respiration modulates R-peak amplitude via thoracic impedance changes
+        # (the EDR — ECG-derived respiration). Strong modulation = healthy
+        # coupling; flat amplitudes = decoupling, often during apnoea/arousal.
+        # This is a SIMPLIFIED proxy for full Thomas 2005 cross-spectral CPC —
+        # captures the amplitude side of cardiopulmonary coupling without the
+        # spectral machinery. Two features:
+        #   cpc_amp_cv  = std/mean of amplitudes  (sensitive but outlier-prone)
+        #   cpc_amp_iqr = IQR/median  (robust)
+        ep_peak_mask = (peak_epoch == i)
+        ep_amps = peak_amplitudes[ep_peak_mask]
+        ep_amps = ep_amps[np.isfinite(ep_amps)]
+        if ep_amps.size >= 4:
+            mean_amp = float(np.mean(ep_amps))
+            if abs(mean_amp) > 1e-9:
+                cpc_amp_cv[i] = float(np.std(ep_amps, ddof=0) / abs(mean_amp))
+            median_amp = float(np.median(ep_amps))
+            if abs(median_amp) > 1e-9:
+                q1, q3 = np.percentile(ep_amps, [25, 75])
+                cpc_amp_iqr[i] = float((q3 - q1) / abs(median_amp))
+
     return {
         "hr_mean": hr_mean,
         "hrv_sdnn": sdnn,
         "hrv_rmssd": rmssd,
         "hrv_pnn50": pnn50,
         "hrv_sampen": sampen,
+        "cpc_amp_cv": cpc_amp_cv,
+        "cpc_amp_iqr": cpc_amp_iqr,
     }
 
 

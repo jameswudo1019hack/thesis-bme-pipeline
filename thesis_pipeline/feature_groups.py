@@ -54,6 +54,7 @@ PHYSIOLOGICAL_PREFIXES: tuple[str, ...] = (
     "hrv_",             # heart rate variability (time + freq domain) — incl hrv_sampen (Phase 1 Exp 1)
     "eeg_",             # EEG band power, complexity
     "ecg_",             # raw ECG-derived features that aren't HRV
+    "cpc_",             # Phase 1 Exp 3 — cardiopulmonary coupling proxy features
     "position_",        # body position
     "spo2_mean",        # statistical, not threshold-based
     "spo2_std",         # statistical
