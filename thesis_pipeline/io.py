@@ -16,6 +16,12 @@ from lxml import etree
 import mne
 
 
+class RespiratoryConceptAuditWarning(UserWarning):
+    """Warns when read_nsrr_xml encounters respiratory-typed events whose
+    EventConcept isn't in the canonical kinds set. Distinct class so callers
+    can filter precisely on category instead of module/stacklevel."""
+
+
 # Channel harmonisation: SHHS EDF files use lab-specific channel names. This
 # map collapses common aliases to a canonical label used throughout the
 # pipeline. Extend as new aliases are discovered.
@@ -133,6 +139,7 @@ def read_nsrr_xml(path: Path) -> tuple[Hypnogram, list[RespiratoryEvent]]:
 
     stage_bins: list[tuple[int, int, str]] = []  # (start_epoch, n_epochs, label)
     resp_events: list[RespiratoryEvent] = []
+    ignored_concepts: dict[str, int] = {}  # respiratory-like concepts not in the kinds set
     max_epoch = 0
 
     for sev in root.iter():
@@ -178,6 +185,19 @@ def read_nsrr_xml(path: Path) -> tuple[Hypnogram, list[RespiratoryEvent]]:
             resp_events.append(
                 RespiratoryEvent(start_sec=start, duration_sec=duration, kind=primary)
             )
+        elif event_type and "Respiratory" in event_type:
+            # Track non-canonical respiratory concepts so callers can audit
+            # any silent label-mapping mismatches across NSRR cohorts.
+            ignored_concepts[primary] = ignored_concepts.get(primary, 0) + 1
+
+    if ignored_concepts:
+        import warnings
+        kinds_str = ", ".join(f"{k!r}×{v}" for k, v in sorted(ignored_concepts.items()))
+        warnings.warn(
+            f"read_nsrr_xml: ignored {sum(ignored_concepts.values())} respiratory-typed "
+            f"event(s) with non-canonical concepts: {kinds_str}",
+            RespiratoryConceptAuditWarning,
+        )
 
     stages = np.full(max_epoch, "?", dtype=object)
     for start_ep, n_ep, label in stage_bins:

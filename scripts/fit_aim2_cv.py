@@ -70,9 +70,12 @@ def load_cohort(features_dir: Path) -> pd.DataFrame:
     but downcasts feature columns to float32 and drops string metadata
     that isn't needed downstream. ~2× memory reduction vs pd.concat default.
     """
-    files = sorted(features_dir.glob("*.parquet"))
+    # Restrict to per-subject epoch parquets; exclude `subject_metadata.parquet`
+    # (which has one row per subject and string subject_id, would crash int32 cast).
+    files = [f for f in sorted(features_dir.glob("*.parquet"))
+             if f.name != "subject_metadata.parquet"]
     if not files:
-        raise FileNotFoundError(f"No parquet files in {features_dir}")
+        raise FileNotFoundError(f"No per-subject parquet files in {features_dir}")
 
     KEEP_META = {"subject_id", "epoch_idx", "apnoea_label", "features_version", "sleep_stage"}
     DROP_META = {"cohort", "epoch_start_sec"}
@@ -103,8 +106,13 @@ def _fold_scale_pos_weight(y: np.ndarray) -> float:
     return neg / max(pos, 1.0)
 
 
-def _fit_and_score(params: dict, X_tr, y_tr, X_va, y_va) -> tuple[float, int]:
-    """Fit LightGBM with early stopping on val; return (val AUC, best iteration)."""
+def _fit_and_score(params: dict, X_tr, y_tr, X_va, y_va) -> tuple[float, int, np.ndarray]:
+    """Fit LightGBM with early stopping on val; return (val AUC, best iteration, val probs).
+
+    Val probs returned so the caller can collect out-of-fold (OOF) predictions
+    across CV folds — used by F10 (threshold selection on unbiased OOF preds
+    instead of the training data the model has already seen).
+    """
     full_params = dict(params)
     full_params["scale_pos_weight"] = _fold_scale_pos_weight(y_tr)
     full_params["verbose"] = -1
@@ -120,7 +128,11 @@ def _fit_and_score(params: dict, X_tr, y_tr, X_va, y_va) -> tuple[float, int]:
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
     )
     probs = model.predict_proba(X_va)[:, 1]
-    return float(roc_auc_score(y_va, probs)), int(model.best_iteration_ or full_params.get("n_estimators", 1000))
+    return (
+        float(roc_auc_score(y_va, probs)),
+        int(model.best_iteration_ or full_params.get("n_estimators", 1000)),
+        probs,
+    )
 
 
 def make_objective(X, y, groups, tv_idx: np.ndarray, k: int = 5):
@@ -128,9 +140,14 @@ def make_objective(X, y, groups, tv_idx: np.ndarray, k: int = 5):
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-            "min_child_samples": trial.suggest_int("min_child_samples", 20, 200),
+            # Search space tightened 2026-04-27 for v8.5 audit-v6 + sleep-only run.
+            # Original lr floor 0.01 + num_leaves up to 127 caused single trials to
+            # take 40+ min on 4.2M rows × 280 cols. Bumping lr floor to 0.03 and
+            # capping num_leaves at 64 keeps each trial ~2-3 min with no expected
+            # AUC loss (v6 best landed at lr=0.113, num_leaves=49, well within range).
+            "learning_rate": trial.suggest_float("learning_rate", 0.03, 0.2, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 15, 64),
+            "min_child_samples": trial.suggest_int("min_child_samples", 50, 300),
             "subsample": trial.suggest_float("subsample", 0.7, 1.0),
             "subsample_freq": 1,
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),
@@ -143,7 +160,7 @@ def make_objective(X, y, groups, tv_idx: np.ndarray, k: int = 5):
         for tr_rel, va_rel in gkf.split(X[tv_idx], y[tv_idx], groups[tv_idx]):
             tr = tv_idx[tr_rel]
             va = tv_idx[va_rel]
-            auc, _ = _fit_and_score(params, X[tr], y[tr], X[va], y[va])
+            auc, _, _ = _fit_and_score(params, X[tr], y[tr], X[va], y[va])
             fold_aucs.append(auc)
             # Optuna pruning: report intermediate and allow early stopping of trials
             trial.report(float(np.mean(fold_aucs)), step=len(fold_aucs))
@@ -239,16 +256,23 @@ def main(trials: int, timeout: int, k: int, seed: int, features_version: str | N
     print(f"\n  best mean-fold val AUC: {best_mean_auc:.4f}")
     print(f"  best params: {json.dumps(best, indent=2)}")
 
-    # Per-fold breakdown at the best hyperparameters (for reporting)
-    print("\n▶ Recomputing per-fold AUCs at best params (for reporting)...")
+    # Per-fold breakdown at the best hyperparameters (for reporting). Also
+    # collect out-of-fold (OOF) predictions on the TV pool so the threshold
+    # can be tuned on validation data the model didn't train on (F10 fix —
+    # was tuned on tv predictions from a model fit on the entire TV pool,
+    # introducing optimistic bias on F1 / precision / recall / best_threshold).
+    print("\n▶ Recomputing per-fold AUCs at best params + collecting OOF preds...")
     final_params = dict(best)
     final_params["n_estimators"] = 2000
     gkf = GroupKFold(n_splits=k)
     per_fold = []
+    n_tv = len(tv_idx)
+    oof_probs = np.full(n_tv, np.nan, dtype=float)
     for i, (tr_rel, va_rel) in enumerate(gkf.split(X[tv_idx], y[tv_idx], groups[tv_idx])):
         tr = tv_idx[tr_rel]
         va = tv_idx[va_rel]
-        auc, best_iter = _fit_and_score(final_params, X[tr], y[tr], X[va], y[va])
+        auc, best_iter, va_probs = _fit_and_score(final_params, X[tr], y[tr], X[va], y[va])
+        oof_probs[va_rel] = va_probs
         per_fold.append({"fold": i + 1, "auc": auc, "best_iter": best_iter,
                           "n_train_subjects": int(len(np.unique(groups[tr]))),
                           "n_val_subjects": int(len(np.unique(groups[va])))})
@@ -273,11 +297,18 @@ def main(trials: int, timeout: int, k: int, seed: int, features_version: str | N
     probs = model.predict_proba(X[test_idx])[:, 1]
     test_auc = float(roc_auc_score(y[test_idx], probs))
     test_ap = float(average_precision_score(y[test_idx], probs))
-    # Tuned-threshold F1 using train+val predictions to pick threshold
-    tv_probs = model.predict_proba(X[tv_idx])[:, 1]
+    # F10 fix: pick threshold on OOF predictions (unbiased — each prediction
+    # came from a fold where that subject was held out). The previous code
+    # picked threshold on `model.predict_proba(X[tv_idx])` which is the
+    # training data the final model was just fit on — overfit threshold,
+    # optimistically biased F1 / precision / recall.
+    print("\n▶ Tuning threshold on OOF CV predictions (F10 fix)...")
     thresholds = np.linspace(0.05, 0.95, 91)
-    tv_f1s = [f1_score(y[tv_idx], (tv_probs > t).astype(int), zero_division=0) for t in thresholds]
-    best_thresh = float(thresholds[int(np.argmax(tv_f1s))])
+    oof_f1s = [
+        f1_score(y[tv_idx], (oof_probs > t).astype(int), zero_division=0)
+        for t in thresholds
+    ]
+    best_thresh = float(thresholds[int(np.argmax(oof_f1s))])
     preds = (probs > best_thresh).astype(int)
     test_f1 = float(f1_score(y[test_idx], preds, zero_division=0))
     test_p = float(precision_score(y[test_idx], preds, zero_division=0))

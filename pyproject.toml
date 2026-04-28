@@ -16,6 +16,7 @@ dependencies = [
     "lxml>=4.9",
     "tqdm>=4.66",
     "click>=8.1",
+    "neurokit2>=0.2.0",  # ECG R-peak detection + freq-domain HRV (Pelidisi 2022)
 ]
 
 [project.optional-dependencies]

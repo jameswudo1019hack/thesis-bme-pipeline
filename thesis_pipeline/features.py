@@ -22,7 +22,7 @@ from .epochs import EPOCH_SECONDS
 
 # Bumped whenever feature extraction logic changes. Written into every parquet
 # so downstream code can filter mixed-version cohorts cleanly.
-FEATURES_VERSION = "2026-04-26-position-v1"
+FEATURES_VERSION = "2026-04-26-audit-v6"
 
 
 # Base columns used as inputs for contextual_features. Anything in the epoch
@@ -67,25 +67,54 @@ SPO2_MIN_VALID = 50.0
 
 
 def _rolling_max(x: np.ndarray, window: int) -> np.ndarray:
-    """Rolling max via a max filter. Window is one-sided (look back)."""
-    pad = np.full(window - 1, np.nan)
-    padded = np.concatenate([pad, x])
-    # scipy's maximum_filter1d gives centred window; approximate one-sided
-    # by using a trailing window on the padded array
-    from scipy.ndimage import maximum_filter1d
+    """Trailing rolling maximum over a one-sided look-back window — **NaN-aware**.
 
-    out = maximum_filter1d(padded, size=window, mode="nearest")
-    return out[window - 1 :]
+    Returns array of same length as ``x``. Within each contiguous finite run
+    (segments separated by NaN samples), each position is the max of up to
+    ``window`` preceding finite samples *from the same run*. NaN samples
+    themselves return NaN; the rolling window never carries pre-NaN data into
+    a post-NaN run.
+
+    Why this shape: SpO₂ artefacts (sensor disconnect / motion) are NaN-masked
+    upstream. A naive trailing rolling-max would skip the NaN samples but still
+    use pre-gap values as the baseline, registering the first post-gap sample
+    as a phantom desaturation. Resetting the rolling window at every NaN gap
+    avoids this.
+
+    History:
+      audit-v1/v2: scipy.ndimage.maximum_filter1d with NaN padding — was actually
+        centred, leaked future samples into the baseline. /codex:adversarial-review caught.
+      audit-v3: pd.Series().rolling().max() — proper trailing, but skipped NaNs and
+        propagated stale baselines across gaps. Codex caught.
+      audit-v4: any-NaN-in-100s-window mask → over-rejected (1 s blip suppressed
+        99 s of detection). Codex caught.
+      audit-v5: 5-sample recovery mask → still leaked pre-gap baseline for 95 s
+        post-recovery because rolling().max() skipped NaN. Codex caught.
+      audit-v6: groupby on NaN cumsum so each post-NaN run gets its own baseline.
+    """
+    s = pd.Series(x)
+    is_nan = s.isna()
+    # Each NaN bumps the group id by 1; within a group the rolling().max()
+    # only sees that group's samples (the NaN itself rolls in as NaN and is
+    # skipped, but no pre-NaN values are in the group either).
+    group_id = is_nan.cumsum()
+    max_ = s.groupby(group_id, sort=False).transform(
+        lambda g: g.rolling(window=window, min_periods=1).max()
+    )
+    max_[is_nan] = np.nan
+    return max_.to_numpy()
 
 
 def _desaturation_events(
     spo2_1hz: np.ndarray, threshold: float = 3.0, min_duration: int = 10
-) -> list[tuple[int, int, float]]:
+) -> list[tuple[int, int, float, float]]:
     """Find desaturation events in a 1-Hz SpO2 trace.
 
     An event starts when SpO2 drops by ≥ ``threshold`` % from a rolling
     100-second baseline (max of preceding 100 s) and lasts ≥ ``min_duration``
-    seconds. Returns a list of (start_sec, duration_sec, nadir_percent).
+    seconds. Returns a list of (start_sec, duration_sec, nadir_percent,
+    baseline_percent) where ``baseline_percent`` is the rolling-max baseline
+    value at event start — consistent with the ODI detection baseline.
     """
     if spo2_1hz.size == 0:
         return []
@@ -93,7 +122,7 @@ def _desaturation_events(
     drop = baseline - spo2_1hz
     is_desat = drop >= threshold
 
-    events: list[tuple[int, int, float]] = []
+    events: list[tuple[int, int, float, float]] = []
     i = 0
     n = is_desat.size
     while i < n:
@@ -103,19 +132,39 @@ def _desaturation_events(
                 j += 1
             if (j - i) >= min_duration:
                 nadir = float(np.nanmin(spo2_1hz[i:j]))
-                events.append((i, j - i, nadir))
+                baseline_at_event_start = float(baseline[i])  # rolling-max at start
+                events.append((i, j - i, nadir, baseline_at_event_start))
             i = j
         else:
             i += 1
     return events
 
 
-def spo2_features(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
+def spo2_features(
+    signal: np.ndarray,
+    sfreq: float,
+    sleep_mask: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
     """Per-epoch SpO2 statistics and desaturation counts.
 
     ``signal`` is expected in % (0–100). SHHS stores SpO2 at 125 Hz but the
     underlying update rate is ~1 Hz (piecewise-constant). We downsample to
     1 Hz for event detection but compute stats on the full-rate signal.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        SpO2 signal at the EDF native rate.
+    sfreq : float
+        EDF native sampling rate.
+    sleep_mask : np.ndarray | None
+        Optional epoch-level boolean array (length ``n_epochs``; True for
+        N1/N2/N3/REM sleep epochs). When provided, ODI count features
+        (``odi3_count``, ``odi4_count``) are zeroed and ``desat_depth`` is
+        set to NaN at non-sleep epoch indices, so that per-night summaries
+        derived from these counts are sleep-only. Per-epoch SpO2 statistics
+        (mean/min/max/std) are unaffected — they are intrinsically per-epoch.
+        Default ``None`` keeps the original behaviour (all epochs counted).
     """
     # mne may or may not scale — if values look like fractions (0–1), rescale
     s = np.asarray(signal, dtype=float)
@@ -140,22 +189,38 @@ def spo2_features(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
 
     odi3_per_epoch = np.zeros(n, dtype=np.int16)
     odi4_per_epoch = np.zeros(n, dtype=np.int16)
-    deepest_desat = np.full(n, np.nan)  # max drop from baseline within epoch
+    deepest_desat = np.full(n, np.nan)  # max drop from per-event baseline within epoch
 
-    for start, dur, nadir in _desaturation_events(spo2_1hz, threshold=3.0):
+    for start, dur, nadir, base in _desaturation_events(spo2_1hz, threshold=3.0):
         ep_idx = start // EPOCH_SECONDS
         if 0 <= ep_idx < n:
             odi3_per_epoch[ep_idx] += 1
 
-    for start, dur, nadir in _desaturation_events(spo2_1hz, threshold=4.0):
+    for start, dur, nadir, base in _desaturation_events(spo2_1hz, threshold=4.0):
         ep_idx = start // EPOCH_SECONDS
         if 0 <= ep_idx < n:
             odi4_per_epoch[ep_idx] += 1
-            # Track the deepest desat per epoch
-            depth = (np.nanmedian(spo2_1hz) - nadir) if np.isfinite(nadir) else np.nan
+            # Depth uses per-event baseline (rolling-max at event start),
+            # matching the ODI detection baseline — avoids underestimating
+            # depth for subjects with chronic nocturnal hypoxaemia.
+            depth = (base - nadir) if (np.isfinite(nadir) and np.isfinite(base)) else np.nan
             prev = deepest_desat[ep_idx]
             if not np.isfinite(prev) or (np.isfinite(depth) and depth > prev):
                 deepest_desat[ep_idx] = depth
+
+    # Apply sleep_mask: zero ODI counts and NaN desat_depth at non-sleep epochs.
+    if sleep_mask is not None:
+        mask = np.asarray(sleep_mask, dtype=bool)
+        # Align mask length to n (clip or pad)
+        if mask.size < n:
+            pad = np.zeros(n - mask.size, dtype=bool)
+            mask = np.concatenate([mask, pad])
+        elif mask.size > n:
+            mask = mask[:n]
+        non_sleep = ~mask
+        odi3_per_epoch[non_sleep] = 0
+        odi4_per_epoch[non_sleep] = 0
+        deepest_desat[non_sleep] = np.nan
 
     return {
         "spo2_mean": mean_,
@@ -166,6 +231,77 @@ def spo2_features(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
         "odi4_count": odi4_per_epoch.astype(np.float32),
         "desat_depth": deepest_desat,
     }
+
+
+def _derive_search_window(
+    spo2_1hz: np.ndarray,
+    events: list,
+    apnoea_kinds: set,
+) -> tuple[int, int]:
+    """Derive per-subject search window per Azarbarzin 2019.
+
+    Stacks event-aligned SpO₂ traces (60 s before to 120 s after event end)
+    into a matrix, takes the column-wise nanmean, then finds the argmax in
+    each half to locate the pre-event baseline peak and post-event recovery
+    peak. The search window is defined as [PRE - pre_peak, post_peak - PRE]
+    seconds relative to event end.
+
+    Returns (lo_sec, hi_sec) — offsets from event end (both positive, meaning
+    lo_sec seconds before event end and hi_sec seconds after). Falls back to
+    (30, 90) if fewer than 5 qualifying events are found or the derived window
+    falls outside sanity bounds.
+    """
+    PRE = 60    # seconds before event end to capture
+    POST = 120  # seconds after event end to capture
+    DEFAULT = (30, 90)
+
+    segments = []
+    for ev in events:
+        if ev.kind not in apnoea_kinds:
+            continue
+        ev_end = int(round(float(ev.start_sec + ev.duration_sec)))
+        lo, hi = ev_end - PRE, ev_end + POST
+        if lo < 0 or hi > spo2_1hz.size:
+            continue
+        seg = spo2_1hz[lo:hi]
+        if seg.size == PRE + POST and np.isfinite(seg).any():
+            segments.append(seg)
+
+    if len(segments) < 5:
+        return DEFAULT
+
+    stacked = np.stack(segments)
+    avg = np.nanmean(stacked, axis=0)
+    # avg[0..PRE-1]: pre-event region; avg[PRE..PRE+POST-1]: post-event region.
+    # Per-column support: how many events provide a finite value at this offset?
+    # Codex audit-v5 finding: the previous gate used ``isfinite(avg)`` which
+    # counted a column as "covered" if even one event contributed. Need actual
+    # support counts on the stacked segments to reject sparse / disjoint cases.
+    # audit-v6: ceil rounding so "majority" is genuinely majority for 5/7-event
+    # subjects (was int(0.5*5)=2 i.e. minority).
+    import math
+    support = np.isfinite(stacked).sum(axis=0)
+    min_support = max(2, math.ceil(0.5 * len(segments)))
+    pre_well_supported = float((support[:PRE] >= min_support).mean())
+    post_well_supported = float((support[PRE:] >= min_support).mean())
+    if pre_well_supported < 0.5 or post_well_supported < 0.5:
+        return DEFAULT
+    # argmax of each region gives the SpO₂ peak (highest = least desaturated).
+    pre_peak_idx = int(np.nanargmax(avg[:PRE]))
+    post_peak_idx = int(np.nanargmax(avg[PRE:])) + PRE
+    # Verify the chosen peak columns themselves have adequate support — a
+    # well-covered half can still pick a poorly-supported peak column.
+    if support[pre_peak_idx] < min_support or support[post_peak_idx] < min_support:
+        return DEFAULT
+
+    lo_sec = PRE - pre_peak_idx   # seconds before event end
+    hi_sec = post_peak_idx - PRE  # seconds after event end
+
+    # Sanity bounds: clamp to physiologically plausible values
+    if lo_sec < 5 or hi_sec < 5 or lo_sec > 90 or hi_sec > 120:
+        return DEFAULT
+
+    return (lo_sec, hi_sec)
 
 
 def hypoxic_burden_features(
@@ -181,26 +317,24 @@ def hypoxic_burden_features(
     *Eur Heart J* paper defines this as the cleanest CVD-mortality predictor
     on SHHS+MrOS (Q5/Q1 fully-adjusted HR = 1.96 [1.11–3.43] on SHHS).
 
-    Implementation (per Azarbarzin 2019 with documented approximation):
+    Implementation (per Azarbarzin 2019):
 
     1. **Event list**: every annotated apnoea + hypopnoea (obstructive,
        central, mixed, hypopnea) — regardless of desaturation threshold.
        The event list is supplied by ``read_nsrr_xml``.
     2. **Baseline**: max SpO₂ in the 100 s **prior to event END** (NOT
        event start — this is the documented gotcha in the paper).
-    3. **Search window** ⚠ — Azarbarzin's method uses a subject-specific
-       window derived from the average event-aligned SpO₂ trace.
-       This implementation uses a **fixed-window approximation** of
-       (-30 s before, +90 s after event end). Documented deviation;
-       cohort-level burden distributions remain interpretable but absolute
-       values won't exactly match published Azarbarzin values.
+    3. **Search window** — derived per subject from the average event-aligned
+       SpO₂ trace (``_derive_search_window``): stack 60 s pre/120 s post
+       segments, take column-wise nanmean, find pre/post argmax peaks to
+       define the window. Falls back to (-30 s, +90 s) if < 5 qualifying
+       events exist or the derived window falls outside sanity bounds.
     4. **Burden = AUC of (baseline − SpO₂)** over the search window where
        the deficit is positive. At 1 Hz integration, the AUC numerically
        equals sum of deficits in %·s.
     5. **Per-epoch attribution**: each event's burden is added to the
-       epoch index containing the event END (= ev.start_sec + ev.duration_sec
-       // EPOCH_SECONDS). An epoch can accumulate burden from multiple
-       events.
+       epoch index containing the event END, using the unrounded event-end
+       time to avoid off-by-one epoch attribution.
 
     Parameters
     ----------
@@ -243,8 +377,6 @@ def hypoxic_burden_features(
 
     # Constants (per Azarbarzin 2019 §Methods)
     BASELINE_WINDOW_SEC = 100  # max SpO₂ in 100 s before event END
-    SEARCH_LO_SEC = 30  # 30 s before event end
-    SEARCH_HI_SEC = 90  # 90 s after event end (-30, +90 fixed approximation)
 
     APNOEA_EVENT_KINDS = {
         "Obstructive Apnea",
@@ -255,6 +387,11 @@ def hypoxic_burden_features(
         "Central apnea",
         "Mixed apnea",
     }
+
+    # Derive per-subject search window; fallback (30, 90) for sparse subjects.
+    SEARCH_LO_SEC, SEARCH_HI_SEC = _derive_search_window(
+        spo2_1hz, events, APNOEA_EVENT_KINDS
+    )
 
     for ev in events:
         if ev.kind not in APNOEA_EVENT_KINDS:
@@ -274,7 +411,7 @@ def hypoxic_burden_features(
         if not np.isfinite(baseline):
             continue
 
-        # Search window: -30 s to +90 s around event END (approximation)
+        # Search window: subject-specific offsets from event end
         sw_lo = max(0, ev_end_idx - SEARCH_LO_SEC)
         sw_hi = min(n_samples_1hz, ev_end_idx + SEARCH_HI_SEC)
         if sw_hi <= sw_lo:
@@ -285,8 +422,10 @@ def hypoxic_burden_features(
             deficit = np.clip(baseline - spo2_seg, 0.0, None)
         auc = float(np.nansum(deficit))  # units: %·s
 
-        # Attribute the AUC to the epoch containing the event END
-        ep_idx = ev_end_idx // EPOCH_SECONDS
+        # Attribute the AUC to the epoch containing the event END.
+        # Use unrounded ev_end_sec for epoch attribution to avoid the int(round())
+        # shifting ~3 % of fractional-second events into the next epoch.
+        ep_idx = int(ev_end_sec // EPOCH_SECONDS)
         if 0 <= ep_idx < n_epochs:
             burden[ep_idx] += auc
 
@@ -490,7 +629,7 @@ def hrv_freq_features(
     ecg: np.ndarray,
     sfreq: float,
     window_sec: int = 120,
-    min_peaks: int = 8,
+    min_peaks: int = 80,
 ) -> dict[str, np.ndarray]:
     """Per-epoch frequency-domain HRV (LF, HF, LF/HF ratio, total power).
 
@@ -546,20 +685,48 @@ def hrv_freq_features(
     half_window = window_sec / 2.0
     peak_times_sec = peaks / sfreq
     epoch_centres = np.arange(n_epochs) * EPOCH_SECONDS + EPOCH_SECONDS / 2.0
+    ecg_duration_sec = ecg.size / sfreq
 
     out = {k: np.full(n_epochs, np.nan, dtype=np.float32) for k in nan_out}
 
+    # Implausible-power clamp: with normalize=False on degraded ECG (sparse /
+    # missed-beat detection), nk.hrv_frequency produces artefactual high LF
+    # because the FFT picks up slow oscillations from the spurious sparse
+    # peaks. Healthy adult LF tops out around 5–10 k ms²; we clamp anything
+    # above 50 k ms² as implausible per Task Force ESC/NASPE 1996 norms.
+    CLAMP_MS2 = 5e4
+
     for i, centre in enumerate(epoch_centres):
+        # At recording boundaries the centred 2-min window is truncated. Scale
+        # the required peak count by the effective window duration so that
+        # low-HR subjects (e.g. < 64 bpm) at boundary epochs aren't NaN'd
+        # purely due to truncation (Codex audit-v4 finding).
         lo, hi = centre - half_window, centre + half_window
-        mask = (peak_times_sec >= lo) & (peak_times_sec <= hi)
-        if int(mask.sum()) < min_peaks:
+        lo_clip = max(0.0, lo)
+        hi_clip = min(ecg_duration_sec, hi)
+        effective_sec = hi_clip - lo_clip
+        if effective_sec <= 0:
+            continue
+        effective_min_peaks = max(20, int(min_peaks * effective_sec / window_sec))
+        mask = (peak_times_sec >= lo_clip) & (peak_times_sec <= hi_clip)
+        if int(mask.sum()) < effective_min_peaks:
             continue
         window_peaks = peaks[mask]
+        # Sanity-check the window's RR distribution before computing freq-HRV.
+        # Catches degraded ECG where peaks are detected but mostly noise-driven
+        # (median RR outside physiological range).
+        rr_ms_window = np.diff(window_peaks) / sfreq * 1000.0
+        if rr_ms_window.size == 0:
+            continue
+        med_rr = float(np.median(rr_ms_window))
+        if med_rr < 400.0 or med_rr > 1500.0:
+            continue
         try:
             results = nk.hrv_frequency(
                 {"ECG_R_Peaks": window_peaks},
                 sampling_rate=int(sfreq),
                 psd_method="welch",
+                normalize=False,  # F3: keep absolute ms² power; True (default) normalises
                 show=False,
                 silent=True,
             )
@@ -570,6 +737,17 @@ def hrv_freq_features(
                 if "HRV_TP" in results.columns
                 else (lf + hf if np.isfinite(lf) and np.isfinite(hf) else np.nan)
             )
+            # Post-hoc clamp on implausible NK output. v3 clamped only LF/HF
+            # but missed TP; v4 nulled all three on any one violation, dropping
+            # valid LF/HF outputs when only TP was high (Codex audit-v5
+            # finding). v5: clamp each independently. TP can legitimately
+            # equal ~LF+HF, so its own bound is 2× the per-band threshold.
+            if np.isfinite(lf) and lf > CLAMP_MS2:
+                lf = np.nan
+            if np.isfinite(hf) and hf > CLAMP_MS2:
+                hf = np.nan
+            if np.isfinite(tp) and tp > 2 * CLAMP_MS2:
+                tp = np.nan
             out["hrv_lf_power"][i] = lf
             out["hrv_hf_power"][i] = hf
             out["hrv_total_power_freq"][i] = tp
@@ -586,12 +764,14 @@ def hrv_freq_features(
 # EEG spectral
 # ─────────────────────────────────────────────────────────────────────────
 
+# AASM 2007 canonical band edges.  Alpha/sigma share 11–13 Hz; sigma/beta
+# share 13–16 Hz — this intentional overlap is the AASM convention.
 EEG_BANDS = {
     "delta": (0.5, 4.0),
     "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "sigma": (12.0, 16.0),
-    "beta": (16.0, 30.0),
+    "alpha": (8.0, 13.0),   # AASM: 8–13 Hz (was 8–12)
+    "sigma": (11.0, 16.0),  # AASM: 11–16 Hz, overlaps alpha (11–13) (was 12–16)
+    "beta":  (13.0, 30.0),  # AASM: 13–30 Hz, overlaps sigma (13–16) (was 16–30)
 }
 
 
@@ -637,12 +817,18 @@ def eeg_band_power(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
         for b, (flo, fhi) in EEG_BANDS.items():
             mask = (freqs >= flo) & (freqs < fhi)
             out[f"eeg_{b}_power"][i] = np.trapezoid(psd[mask], freqs[mask])
-        # Spectral edge 95%
+        # Spectral edge 95% — use trapezoid-based cumulative integral to be
+        # consistent with the band-power integration above (np.trapezoid).
         if total > 0:
-            cumul = np.cumsum(psd[in_range]) * (freqs[1] - freqs[0])
+            psd_in = psd[in_range]
+            freqs_in = freqs[in_range]
+            # Cumulative trapezoid: cumul[k] = trapezoid(psd_in[0:k+1], freqs_in[0:k+1])
+            # scipy.integrate.cumulative_trapezoid gives length-(n-1) array; prepend 0.
+            from scipy.integrate import cumulative_trapezoid
+            cumul = np.concatenate([[0.0], cumulative_trapezoid(psd_in, freqs_in)])
             edge_idx = np.searchsorted(cumul, 0.95 * total)
-            if 0 <= edge_idx < np.sum(in_range):
-                out["eeg_spectral_edge95"][i] = freqs[in_range][edge_idx]
+            if 0 <= edge_idx < len(freqs_in):
+                out["eeg_spectral_edge95"][i] = freqs_in[edge_idx]
 
     # Relative powers (avoid divide-by-zero)
     total = out["eeg_total_power"]

@@ -69,8 +69,10 @@ def process_subject(sp: shhs.SubjectPaths) -> pd.DataFrame:
     """Turn one subject's EDF + NSRR XML into a labelled, feature-enriched epoch frame."""
     raw = read_edf(sp.edf, preload=True)
     hypno, events = read_nsrr_xml(sp.nsrr_xml)
-    n_epochs = int(raw.times[-1]) // 30
     sfreq = float(raw.info["sfreq"])
+    # raw.times[-1] is the last *sample* time = (N-1)/sfreq, which underestimates
+    # duration by one sample interval; use n_times directly to avoid off-by-one.
+    n_epochs = raw.n_times // int(round(30 * sfreq))
 
     frame = build_epoch_frame(
         subject_id=sp.subject_id,
@@ -82,9 +84,12 @@ def process_subject(sp: shhs.SubjectPaths) -> pd.DataFrame:
 
     features: dict[str, np.ndarray] = {}
 
+    # Build epoch-level sleep mask (True for N1/N2/N3/REM) for sleep-only ODI.
+    sleep_mask = frame["sleep_stage"].isin(["N1", "N2", "N3", "REM"]).to_numpy()
+
     spo2 = _pick_channel(raw, SPO2_ALIASES)
     if spo2 is not None:
-        features.update(spo2_features(spo2, sfreq))
+        features.update(spo2_features(spo2, sfreq, sleep_mask=sleep_mask))
         features.update(hypoxic_burden_features(spo2, sfreq, events, n_epochs))  # NEW T4
 
     ecg = _pick_channel(raw, ECG_ALIASES)

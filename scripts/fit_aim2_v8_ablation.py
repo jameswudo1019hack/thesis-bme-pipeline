@@ -90,9 +90,12 @@ FEATURES_DIR = CODE_ROOT / "features"
 
 
 def load_cohort(features_dir: Path) -> pd.DataFrame:
-    files = sorted(features_dir.glob("*.parquet"))
+    # Restrict to per-subject epoch parquets; exclude `subject_metadata.parquet`
+    # (one row per subject; would corrupt the epoch-level training frame).
+    files = [f for f in sorted(features_dir.glob("*.parquet"))
+             if f.name != "subject_metadata.parquet"]
     if not files:
-        raise FileNotFoundError(f"No parquet files in {features_dir}")
+        raise FileNotFoundError(f"No per-subject parquet files in {features_dir}")
 
     KEEP_META = {"subject_id", "epoch_idx", "apnoea_label", "features_version"}
     DROP_META = {"cohort", "epoch_start_sec", "sleep_stage"}

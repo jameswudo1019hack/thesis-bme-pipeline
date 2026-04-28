@@ -124,7 +124,13 @@ def subject_metadata(epoch_frame: "pd.DataFrame") -> dict[str, float]:
     else:
         waso_min = 0.0
 
-    n_apnoea = float(epoch_frame["apnoea_label"].sum()) if "apnoea_label" in epoch_frame.columns else 0.0
+    # Count apnoea epochs only during sleep — AHI is events per hour of sleep,
+    # so numerator and denominator should both be sleep-only.
+    if "apnoea_label" in epoch_frame.columns:
+        sleep_idx = epoch_frame["sleep_stage"].isin(["N1", "N2", "N3", "REM"])
+        n_apnoea = float(((epoch_frame["apnoea_label"] == 1) & sleep_idx).sum())
+    else:
+        n_apnoea = 0.0
 
     out = {
         "n_epochs": float(n_epochs),
