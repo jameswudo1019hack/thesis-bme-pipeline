@@ -40,6 +40,10 @@ ROLLING_BASE_COLS = (
     "eeg_delta_power", "eeg_theta_power", "eeg_alpha_power",
     "eeg_sigma_power", "eeg_beta_power", "eeg_total_power", "eeg_spectral_edge95",
     "eeg_delta_rel", "eeg_theta_rel", "eeg_alpha_rel", "eeg_sigma_rel", "eeg_beta_rel",
+    "ecg_band_low_power", "ecg_band_mid_low_power", "ecg_band_mid_power",  # Phase 1 Exp 4
+    "ecg_band_mid_high_power", "ecg_band_high_power", "ecg_band_total_power",
+    "ecg_band_low_rel", "ecg_band_mid_low_rel", "ecg_band_mid_rel",
+    "ecg_band_mid_high_rel", "ecg_band_high_rel",
     "resp_airflow_rms", "resp_airflow_std", "resp_thor_rms", "resp_abdo_rms",
     "resp_thor_abdo_corr", "resp_breath_rate_bpm",
     "position_right_frac", "position_left_frac", "position_supine_frac",  # NEW T5
@@ -1042,6 +1046,83 @@ def eeg_band_power(signal: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
     for b in bands_keys:
         out[f"eeg_{b}_rel"] = out[f"eeg_{b}_power"] / safe
     return out
+
+
+# Phase 1 Exp 4 — multi-scale ECG band power.
+#
+# Hypothesis: multi-scale frequency content of ECG adds signal beyond time-/
+# freq-domain HRV features (which summarise inter-beat interval dynamics, not
+# the waveform shape itself). The 5 bands roughly correspond to a 5-level
+# Daubechies wavelet decomposition at 125 Hz sampling — without taking on a
+# pywt dependency. Captures:
+#   low (0–2 Hz)        — baseline drift, very-slow respiration coupling
+#   mid_low (2–8 Hz)    — T-wave / late repolarisation
+#   mid (8–16 Hz)       — primary QRS energy band (apnoeic events alter QRS shape)
+#   mid_high (16–32 Hz) — fast QRS components, motion artifact
+#   high (32–62 Hz)     — high-freq noise / muscle artifact (interpret with care)
+#
+# References:
+#   Khandoker, Karmakar, Palaniswami 2009 — wavelet ECG features for OSA detection
+#   Almazaydeh, Faezipour, Elleithy 2012 — neural net on ECG-derived features for SA
+ECG_BANDS: dict[str, tuple[float, float]] = {
+    "low":      (0.5,  2.0),
+    "mid_low":  (2.0,  8.0),
+    "mid":      (8.0,  16.0),
+    "mid_high": (16.0, 32.0),
+    "high":     (32.0, 62.0),
+}
+
+
+def ecg_band_power(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
+    """Per-epoch ECG band power across 5 wavelet-like bands.
+
+    Phase 1 Exp 4. Welch PSD on each 30-s epoch, integrated over each band
+    (numerical trapezoid) to give absolute power. Plus relative power per band
+    (band / total). Total of 11 features per epoch (5 absolute + 5 relative
+    + 1 total).
+    """
+    sig = np.asarray(ecg, dtype=float)
+    ep = _epoch_view(sig, sfreq)
+    n_epochs = ep.shape[0]
+    # Use shorter Welch segments since epoch is only 30s; 4-s segs give
+    # frequency resolution ~0.25 Hz which is plenty for the band integrations.
+    nperseg = min(int(4 * sfreq), ep.shape[1])
+
+    bands_keys = list(ECG_BANDS.keys())
+    out: dict[str, np.ndarray] = {
+        **{f"ecg_band_{b}_power": np.full(n_epochs, np.nan, dtype=np.float32) for b in bands_keys},
+        "ecg_band_total_power": np.full(n_epochs, np.nan, dtype=np.float32),
+    }
+
+    for i in range(n_epochs):
+        epoch = ep[i]
+        if not np.isfinite(epoch).any() or np.nanstd(epoch) == 0:
+            continue
+        try:
+            freqs, psd = sps.welch(epoch, fs=sfreq, nperseg=nperseg)
+        except Exception:
+            continue
+        # Total power across the union of bands (0.5 – Nyquist or 62 Hz)
+        nyquist = sfreq / 2.0
+        upper = min(nyquist, 62.0)
+        in_range = (freqs >= 0.5) & (freqs <= upper)
+        total = float(np.trapezoid(psd[in_range], freqs[in_range]))
+        out["ecg_band_total_power"][i] = total
+        for b, (flo, fhi) in ECG_BANDS.items():
+            fhi_eff = min(fhi, nyquist)  # in case sfreq < 124
+            if fhi_eff <= flo:
+                continue
+            mask = (freqs >= flo) & (freqs < fhi_eff)
+            if mask.any():
+                out[f"ecg_band_{b}_power"][i] = float(np.trapezoid(psd[mask], freqs[mask]))
+
+    # Relative powers (avoid divide-by-zero)
+    total = out["ecg_band_total_power"]
+    safe = np.where(total > 1e-20, total, np.nan)
+    for b in bands_keys:
+        out[f"ecg_band_{b}_rel"] = (out[f"ecg_band_{b}_power"] / safe).astype(np.float32)
+    return out
+
 
 
 # ─────────────────────────────────────────────────────────────────────────

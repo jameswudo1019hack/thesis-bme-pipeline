@@ -35,6 +35,7 @@ from thesis_pipeline.epochs import build_epoch_frame  # noqa: E402
 from thesis_pipeline.features import (  # noqa: E402
     FEATURES_VERSION,
     contextual_features,
+    ecg_band_power,
     eeg_band_power,
     hrv_features,
     hrv_freq_features,
@@ -96,6 +97,7 @@ def process_subject(sp: shhs.SubjectPaths) -> pd.DataFrame:
     if ecg is not None:
         features.update(hrv_features(ecg, sfreq))
         features.update(hrv_freq_features(ecg, sfreq))  # NEW T3 — frequency-domain HRV
+        features.update(ecg_band_power(ecg, sfreq))     # Phase 1 Exp 4 — multi-scale ECG band power
 
     eeg = _pick_channel(raw, EEG_ALIASES)
     if eeg is not None:
