@@ -51,12 +51,13 @@ AASM_RULE_PREFIXES: tuple[str, ...] = (
 # Features that measure responses to apnoeic events (autonomic / cortical / postural)
 PHYSIOLOGICAL_PREFIXES: tuple[str, ...] = (
     "hr_",              # heart rate
-    "hrv_",             # heart rate variability (time + freq domain)
+    "hrv_",             # heart rate variability (time + freq domain) — incl hrv_sampen (Phase 1 Exp 1)
     "eeg_",             # EEG band power, complexity
     "ecg_",             # raw ECG-derived features that aren't HRV
     "position_",        # body position
     "spo2_mean",        # statistical, not threshold-based
     "spo2_std",         # statistical
+    "spo2_sampen",      # Phase 1 Exp 1 — SpO2 sample entropy (complexity, not threshold)
     "spo2_range",       # statistical (range = max - min, not threshold)
     "resp_chest",       # chest belt — effort, not airflow drop
     "resp_abdo",        # abdominal belt — effort, not airflow drop

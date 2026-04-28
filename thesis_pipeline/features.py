@@ -22,16 +22,18 @@ from .epochs import EPOCH_SECONDS
 
 # Bumped whenever feature extraction logic changes. Written into every parquet
 # so downstream code can filter mixed-version cohorts cleanly.
-FEATURES_VERSION = "2026-04-26-audit-v6"
+FEATURES_VERSION = "2026-05-01-sampen-v1"
 
 
 # Base columns used as inputs for contextual_features. Anything in the epoch
 # frame matching one of these gets a set of lag/lead/rolling derivatives.
 ROLLING_BASE_COLS = (
     "spo2_mean", "spo2_min", "spo2_max", "spo2_std",
+    "spo2_sampen",  # NEW Phase 1 Exp 1 — sample entropy on per-epoch SpO2 (1 Hz)
     "odi3_count", "odi4_count", "desat_depth",
     "hypoxic_burden_epoch",  # NEW T4 — Azarbarzin 2019 hypoxic burden
     "hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50",
+    "hrv_sampen",  # NEW Phase 1 Exp 1 — sample entropy on per-epoch RR intervals
     "hrv_lf_power", "hrv_hf_power", "hrv_lf_hf_ratio", "hrv_total_power_freq",  # NEW T3
     "eeg_delta_power", "eeg_theta_power", "eeg_alpha_power",
     "eeg_sigma_power", "eeg_beta_power", "eeg_total_power", "eeg_spectral_edge95",
@@ -41,6 +43,73 @@ ROLLING_BASE_COLS = (
     "position_right_frac", "position_left_frac", "position_supine_frac",  # NEW T5
     "position_prone_frac", "position_upright_frac",  # NEW T5
 )
+
+
+def _sample_entropy(x: np.ndarray, m: int = 2, r: float | None = None) -> float:
+    """Sample entropy (SampEn) for a 1-D series.
+
+    Phase 1 Exp 1 (added 2026-05-01). Sample entropy quantifies time-series
+    irregularity / complexity. For apnoea-detection contexts:
+      - Healthy / regular breathing → SpO₂ is smooth, RR intervals stable → low SampEn
+      - Apnoeic / arousal-driven breathing → irregular SpO₂ recovery, RR scatter → higher SampEn
+
+    Parameters
+    ----------
+    x : np.ndarray
+        1-D series. NaNs are dropped before computation.
+    m : int
+        Embedding dimension (default 2 — Pincus & Goldberger 1994 standard).
+    r : float | None
+        Tolerance. If None, defaults to 0.2 × std of the (NaN-dropped) series
+        (Richman & Moorman 2000 standard for physiological signals).
+
+    Returns
+    -------
+    float
+        SampEn value, or NaN if the series is too short / pathological.
+
+    Notes
+    -----
+    Uses the textbook O(N²) definition (Richman & Moorman 2000). For our
+    typical inputs (30-sample SpO₂ epochs, 20–50-sample RR-interval epochs)
+    the cost is negligible — ~1 ms per epoch. NeuroKit2's
+    ``nk.entropy_sample`` is a drop-in alternative but adds dependency
+    overhead and behaves identically on these short series.
+    """
+    arr = np.asarray(x, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = arr.size
+    # Need at least m+2 points to form one (m+1)-template comparison
+    if n < m + 2:
+        return float("nan")
+    std = float(arr.std(ddof=0))
+    if std <= 0.0:
+        # Constant signal — SampEn is conventionally 0 (or undefined; NaN is safer)
+        return float("nan")
+    if r is None:
+        r = 0.2 * std
+
+    # Build embedding matrices for length m and m+1
+    def _phi(mm: int) -> int:
+        templates = np.lib.stride_tricks.sliding_window_view(arr, mm)  # (n-mm+1, mm)
+        # Chebyshev distance (max abs diff) between every pair of templates
+        # Vectorized: distance matrix is (T, T) where T = n-mm+1
+        # For our short series (n ~ 30–50), T ~ 28–48, so the (T, T) matrix
+        # is ~50×50 — fine in memory.
+        diffs = np.abs(templates[:, None, :] - templates[None, :, :]).max(axis=2)
+        # Exclude self-matches (Richman 2000: i != j)
+        T = templates.shape[0]
+        within = (diffs <= r).sum() - T  # subtract self-matches on diagonal
+        return int(within // 2)  # symmetric, count unordered pairs
+
+    A = _phi(m + 1)  # (m+1)-template matches
+    B = _phi(m)      # m-template matches
+    if B == 0 or A == 0:
+        # No template matches — undefined log; conventionally NaN here
+        # (some implementations return log(N) as upper bound; we use NaN
+        # so downstream median-imputation handles it consistently)
+        return float("nan")
+    return float(-np.log(A / B))
 
 
 def _epoch_view(signal: np.ndarray, sfreq: float) -> np.ndarray:
@@ -222,11 +291,27 @@ def spo2_features(
         odi4_per_epoch[non_sleep] = 0
         deepest_desat[non_sleep] = np.nan
 
+    # Phase 1 Exp 1 — sample entropy on 1 Hz SpO2 per epoch (~30 samples).
+    # Captures breathing-cycle irregularity that statistical moments miss.
+    spo2_1hz_ep = _epoch_view(spo2_1hz, 1.0)
+    spo2_sampen = np.array(
+        [_sample_entropy(spo2_1hz_ep[i], m=2) for i in range(spo2_1hz_ep.shape[0])],
+        dtype=np.float32,
+    )
+    # Pad/clip to align with n epochs from full-rate epoch_view
+    if spo2_sampen.size < n:
+        spo2_sampen = np.concatenate(
+            [spo2_sampen, np.full(n - spo2_sampen.size, np.nan, dtype=np.float32)]
+        )
+    elif spo2_sampen.size > n:
+        spo2_sampen = spo2_sampen[:n]
+
     return {
         "spo2_mean": mean_,
         "spo2_min": min_,
         "spo2_max": max_,
         "spo2_std": std_,
+        "spo2_sampen": spo2_sampen,
         "odi3_count": odi3_per_epoch.astype(np.float32),
         "odi4_count": odi4_per_epoch.astype(np.float32),
         "desat_depth": deepest_desat,
@@ -575,7 +660,7 @@ def hrv_features(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
     n_epochs = _n_epochs(ecg.size, sfreq)
     nan_out = {
         k: np.full(n_epochs, np.nan)
-        for k in ("hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50")
+        for k in ("hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50", "hrv_sampen")
     }
 
     peaks = r_peaks(ecg, sfreq)
@@ -604,6 +689,7 @@ def hrv_features(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
     sdnn = np.full(n_epochs, np.nan)
     rmssd = np.full(n_epochs, np.nan)
     pnn50 = np.full(n_epochs, np.nan)
+    sampen = np.full(n_epochs, np.nan)  # Phase 1 Exp 1
 
     for i in range(n_epochs):
         mask = valid & (rr_epoch == i)
@@ -616,12 +702,17 @@ def hrv_features(ecg: np.ndarray, sfreq: float) -> dict[str, np.ndarray]:
         if diffs.size > 0:
             rmssd[i] = float(np.sqrt(np.mean(diffs * diffs)))
             pnn50[i] = float((np.abs(diffs) > 50.0).mean())
+        # Phase 1 Exp 1 — SampEn on per-epoch RR intervals (typically 20–50 RRs)
+        # Need ≥ m+2 = 4 points minimum; gracefully NaN otherwise.
+        if epoch_rr.size >= 4:
+            sampen[i] = _sample_entropy(epoch_rr, m=2)
 
     return {
         "hr_mean": hr_mean,
         "hrv_sdnn": sdnn,
         "hrv_rmssd": rmssd,
         "hrv_pnn50": pnn50,
+        "hrv_sampen": sampen,
     }
 
 
