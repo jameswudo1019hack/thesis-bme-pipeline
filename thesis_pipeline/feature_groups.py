@@ -58,6 +58,7 @@ PHYSIOLOGICAL_PREFIXES: tuple[str, ...] = (
     "spo2_mean",        # statistical, not threshold-based
     "spo2_std",         # statistical
     "spo2_sampen",      # Phase 1 Exp 1 — SpO2 sample entropy (complexity, not threshold)
+    "spo2_psd",         # Phase 1 Exp 2 — SpO2 Welch PSD (frequency content; apnea_band/total/ratio)
     "spo2_range",       # statistical (range = max - min, not threshold)
     "resp_chest",       # chest belt — effort, not airflow drop
     "resp_abdo",        # abdominal belt — effort, not airflow drop

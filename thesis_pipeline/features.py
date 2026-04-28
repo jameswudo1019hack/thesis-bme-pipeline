@@ -22,18 +22,19 @@ from .epochs import EPOCH_SECONDS
 
 # Bumped whenever feature extraction logic changes. Written into every parquet
 # so downstream code can filter mixed-version cohorts cleanly.
-FEATURES_VERSION = "2026-05-01-sampen-v1"
+FEATURES_VERSION = "2026-05-01-phase1batch-v1"
 
 
 # Base columns used as inputs for contextual_features. Anything in the epoch
 # frame matching one of these gets a set of lag/lead/rolling derivatives.
 ROLLING_BASE_COLS = (
     "spo2_mean", "spo2_min", "spo2_max", "spo2_std",
-    "spo2_sampen",  # NEW Phase 1 Exp 1 — sample entropy on per-epoch SpO2 (1 Hz)
+    "spo2_sampen",  # Phase 1 Exp 1 — sample entropy on per-epoch SpO2 (1 Hz)
+    "spo2_psd_apnea_band", "spo2_psd_total", "spo2_psd_apnea_ratio",  # Phase 1 Exp 2 — Welch PSD on 2-min window
     "odi3_count", "odi4_count", "desat_depth",
     "hypoxic_burden_epoch",  # NEW T4 — Azarbarzin 2019 hypoxic burden
     "hr_mean", "hrv_sdnn", "hrv_rmssd", "hrv_pnn50",
-    "hrv_sampen",  # NEW Phase 1 Exp 1 — sample entropy on per-epoch RR intervals
+    "hrv_sampen",  # Phase 1 Exp 1 — sample entropy on per-epoch RR intervals
     "hrv_lf_power", "hrv_hf_power", "hrv_lf_hf_ratio", "hrv_total_power_freq",  # NEW T3
     "eeg_delta_power", "eeg_theta_power", "eeg_alpha_power",
     "eeg_sigma_power", "eeg_beta_power", "eeg_total_power", "eeg_spectral_edge95",
@@ -110,6 +111,75 @@ def _sample_entropy(x: np.ndarray, m: int = 2, r: float | None = None) -> float:
         # so downstream median-imputation handles it consistently)
         return float("nan")
     return float(-np.log(A / B))
+
+
+def _spo2_psd_per_epoch(
+    spo2_1hz: np.ndarray,
+    n_epochs: int,
+    window_sec: int = 120,
+    apnea_band: tuple[float, float] = (0.01, 0.067),
+) -> dict[str, np.ndarray]:
+    """Per-epoch Welch PSD on a sliding 2-min window centred at each epoch.
+
+    Phase 1 Exp 2. Captures the apnoea-cycle frequency content of SpO₂.
+
+    Periodic apnoea (Cheyne-Stokes-like or OSA-cluster) creates a characteristic
+    oscillation in SpO₂ at the period of the apnoea-recovery cycle, typically
+    20–100 s (= 0.01–0.05 Hz). A 30-s epoch is too short to resolve this band
+    (frequency resolution would be ~0.033 Hz, coarser than the band itself), so
+    we use a 2-min window centred on the epoch midpoint, giving ~0.008 Hz
+    resolution.
+
+    Returns
+    -------
+    dict with three keys:
+      "apnea_band":   power in the apnoea-cycle band (0.01–0.067 Hz default).
+      "total":        total spectral power across the resolvable band.
+      "apnea_ratio":  apnea_band / total (dimensionless, 0–1).
+
+    All three arrays length ``n_epochs``. NaN for epochs with too few finite
+    samples in the window or zero variance.
+    """
+    out_band = np.full(n_epochs, np.nan, dtype=np.float32)
+    out_total = np.full(n_epochs, np.nan, dtype=np.float32)
+    out_ratio = np.full(n_epochs, np.nan, dtype=np.float32)
+
+    half_win = window_sec // 2
+    half_epoch = EPOCH_SECONDS // 2
+    n_signal = spo2_1hz.size
+
+    for ep_idx in range(n_epochs):
+        center = ep_idx * EPOCH_SECONDS + half_epoch
+        start = max(0, center - half_win)
+        end = min(n_signal, center + half_win)
+        seg = spo2_1hz[start:end]
+        seg = seg[np.isfinite(seg)]
+        if seg.size < 30:  # too few samples for reliable PSD
+            continue
+        if seg.std(ddof=0) == 0.0:  # constant signal — no spectral content
+            continue
+        # nperseg ≤ segment length; use min(64, seg.size) for short segments
+        nperseg = min(64, seg.size)
+        try:
+            f, psd = sps.welch(seg, fs=1.0, nperseg=nperseg, detrend="linear")
+        except Exception:
+            continue
+        if psd.size == 0:
+            continue
+        # Frequency bin width Δf — needed to integrate power over a band
+        df = f[1] - f[0] if f.size > 1 else 1.0 / nperseg
+        band_mask = (f >= apnea_band[0]) & (f <= apnea_band[1])
+        total_power = float(psd.sum() * df)
+        if band_mask.any():
+            band_power = float(psd[band_mask].sum() * df)
+        else:
+            band_power = 0.0
+        out_band[ep_idx] = band_power
+        out_total[ep_idx] = total_power
+        if total_power > 0:
+            out_ratio[ep_idx] = band_power / total_power
+
+    return {"apnea_band": out_band, "total": out_total, "apnea_ratio": out_ratio}
 
 
 def _epoch_view(signal: np.ndarray, sfreq: float) -> np.ndarray:
@@ -306,12 +376,21 @@ def spo2_features(
     elif spo2_sampen.size > n:
         spo2_sampen = spo2_sampen[:n]
 
+    # Phase 1 Exp 2 — Welch PSD on 2-min sliding window centred per epoch.
+    # Captures apnoea-cycle frequency content (typical OSA cycles 20-100s →
+    # 0.01-0.05 Hz band). 30-sample epochs are too short for useful spectral
+    # resolution; a 2-min window gives ~0.008 Hz frequency bins.
+    psd_features = _spo2_psd_per_epoch(spo2_1hz, n_epochs=n)
+
     return {
         "spo2_mean": mean_,
         "spo2_min": min_,
         "spo2_max": max_,
         "spo2_std": std_,
         "spo2_sampen": spo2_sampen,
+        "spo2_psd_apnea_band": psd_features["apnea_band"],
+        "spo2_psd_total": psd_features["total"],
+        "spo2_psd_apnea_ratio": psd_features["apnea_ratio"],
         "odi3_count": odi3_per_epoch.astype(np.float32),
         "odi4_count": odi4_per_epoch.astype(np.float32),
         "desat_depth": deepest_desat,
