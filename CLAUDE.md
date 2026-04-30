@@ -89,4 +89,4 @@ Don't just commit and move on. Log it in the vault — see the workflow in `../C
 - Don't commit `features/` or `models/` artefacts.
 - Don't bypass the OneDrive pin/evict loop by trying to download all 214 GB at once.
 - Don't hard-code subject IDs or paths into `thesis_pipeline/`; pass them as arguments.
-- Don't rename `fit_aim2_cv.py` outputs without updating the running log table in `../Vault/Aims/Aim 2 - Baseline Experiments.md`.
+- Don't rename `fit_aim2_cv.py` outputs without updating the running log table in `../Thesis Vault/Aims/Aim 2 - Baseline Experiments.md`.

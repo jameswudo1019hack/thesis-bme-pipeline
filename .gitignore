@@ -19,6 +19,11 @@ features/
 *.xml
 !*-pyproject.xml  # safety hatch in case of unrelated XML configs
 
+# Bulk archives (tarballs of features for Drive transfer — never in git).
+*.tar
+*.tar.gz
+*.zip
+
 # ---- Trained models / experiments -------------------------------------------
 models/
 *.pkl

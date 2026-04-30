@@ -127,14 +127,34 @@ def _process_one(args: tuple[int, bool]) -> tuple[int, str]:
         if parquet_path.exists() and not overwrite:
             return (sid, "skipped_existing")
 
-        # Trigger downloads
+        # Trigger downloads (retry on transient OneDrive timeouts — Errno 60).
+        # PermissionError / EPERM is NOT transient: fail fast so a permission
+        # issue (revoked FDA, OneDrive throttle returning EPERM) doesn't burn
+        # 30s/subject in dead retries.
         for p in (sp.edf, sp.nsrr_xml):
-            try:
-                if not shhs.is_local(p):
-                    with open(p, "rb") as f:
-                        f.read(4096)
-            except Exception as e:
-                return (sid, f"download_error:{type(e).__name__}:{e}")
+            last_err: Exception | None = None
+            for attempt in range(3):
+                try:
+                    if not shhs.is_local(p):
+                        with open(p, "rb") as f:
+                            f.read(4096)
+                    last_err = None
+                    break
+                except TimeoutError as e:
+                    last_err = e
+                    if attempt < 2:
+                        time.sleep(10)
+                except OSError as e:
+                    if getattr(e, "errno", None) == 60:  # ETIMEDOUT
+                        last_err = e
+                        if attempt < 2:
+                            time.sleep(10)
+                    else:
+                        return (sid, f"download_error:{type(e).__name__}:{e}")
+                except Exception as e:
+                    return (sid, f"download_error:{type(e).__name__}:{e}")
+            if last_err is not None:
+                return (sid, f"download_error:{type(last_err).__name__}:{last_err}")
 
         if not shhs.is_subject_local(sp):
             return (sid, "still_cloud_only")
