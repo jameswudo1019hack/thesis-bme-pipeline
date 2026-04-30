@@ -73,6 +73,7 @@ sys.path.insert(0, str(CODE_ROOT))
 
 from thesis_pipeline.epochs import wake_mask  # noqa: E402
 from thesis_pipeline.extended_metrics import write_extended_metrics  # noqa: E402
+from thesis_pipeline.feature_groups import feature_subset  # noqa: E402
 
 FEATURES_DIR = CODE_ROOT / "features"
 OUT_ROOT = CODE_ROOT / "models" / "aim2_phase1_batch"
@@ -344,19 +345,34 @@ def fit_one_config(
 @click.option("--exp", default="all", show_default=True,
               type=click.Choice(["all", "exp1", "exp2", "exp3", "exp4"]),
               help="Run a single config or 'all' for the cumulative ablation")
-def main(features_version: str, seed: int, exp: str) -> None:
-    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+@click.option("--feature-mode", default="full", show_default=True,
+              type=click.Choice(["full", "physio_only", "aasm_only"]),
+              help="Apply feature_groups taxonomy filter BEFORE cumulative logic. "
+                   "'physio_only' drops AASM-rule features (the decisive test of whether Phase 1 "
+                   "additions add signal independent of rule-recapitulation). "
+                   "'full' is the unfiltered run (existing exp1-4 dirs).")
+def main(features_version: str, seed: int, exp: str, feature_mode: str) -> None:
+    # When mode != full, nest under a mode subdir to avoid clobbering the
+    # existing aim2_phase1_batch/{exp1..exp4} (which are full-mode results).
+    out_root = OUT_ROOT if feature_mode == "full" else (OUT_ROOT / feature_mode)
+    out_root.mkdir(parents=True, exist_ok=True)
 
     print(f"\n=== Aim 2 Phase 1 cumulative feature ablation (Exp 1-4) ===")
     print(f"  Features dir: {FEATURES_DIR}")
-    print(f"  Output dir:   {OUT_ROOT}")
+    print(f"  Output dir:   {out_root}")
     print(f"  Features version: {features_version}")
     print(f"  Seed: {seed}")
+    print(f"  Feature mode: {feature_mode}")
     print(f"  Configs: {exp}\n")
 
     df = load_cohort(FEATURES_DIR, version=features_version)
     feature_cols_all = [c for c in df.columns if c not in NON_FEATURE]
-    print(f"  Total features (excluding meta): {len(feature_cols_all)}\n")
+    print(f"  Total features (excluding meta): {len(feature_cols_all)}")
+    if feature_mode != "full":
+        before = len(feature_cols_all)
+        feature_cols_all = feature_subset(feature_cols_all, mode=feature_mode)
+        print(f"  Taxonomy filter (mode={feature_mode}): kept {len(feature_cols_all)}/{before} features")
+    print()
 
     # Outer split — IDENTICAL to all prior v6/v8/v8.5/Phase 1 work
     X_dummy = np.empty(len(df))
@@ -377,24 +393,25 @@ def main(features_version: str, seed: int, exp: str) -> None:
             "n_test_subjects": int(len(np.unique(groups_arr[test_idx]))),
             "n_test_epochs": int(len(test_idx)),
         },
+        "feature_mode": feature_mode,
         "phase1_new_cols": PHASE1_NEW_BASE_COLS,
         "configs": {},
     }
 
     for name in configs_to_run:
         feature_cols = features_for_exp(feature_cols_all, exp_id=name)
-        out_dir = OUT_ROOT / name
+        out_dir = out_root / name
         result = fit_one_config(name, df, feature_cols, tv_idx, test_idx, out_dir)
         summary["configs"][name] = result
 
-    print(f"\n\n{'='*78}\n=== COMPACT COMPARISON ===\n{'='*78}\n")
+    print(f"\n\n{'='*78}\n=== COMPACT COMPARISON ({feature_mode}) ===\n{'='*78}\n")
     print(f"{'Config':6s}  {'Features':>9s}  {'Test AUC':>9s}  {'Subject 95% CI':>20s}  {'AUC-PR':>8s}  {'F1':>7s}")
     for name, r in summary["configs"].items():
         ci = f"[{r['test_auc_ci_low']:.4f}, {r['test_auc_ci_high']:.4f}]"
         print(f"{name:6s}  {r['n_features']:>9d}  {r['test_auc_roc']:>9.4f}  {ci:>20s}  {r['test_auc_pr']:>8.4f}  {r['test_f1_tuned']:>7.4f}")
 
-    (OUT_ROOT / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"\nSummary saved to: {OUT_ROOT / 'summary.json'}")
+    (out_root / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"\nSummary saved to: {out_root / 'summary.json'}")
 
 
 if __name__ == "__main__":
