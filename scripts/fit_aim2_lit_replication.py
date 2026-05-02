@@ -99,7 +99,12 @@ FIXED_N_ESTIMATORS = 800
 FIXED_EARLY_STOPPING = 50
 
 
-def load_cohort(features_dir: Path, version: str = "2026-04-26-audit-v6") -> pd.DataFrame:
+def load_cohort(features_dir: Path, version: str = "2026-05-01-phase1batch-v1") -> pd.DataFrame:
+    """Load cohort. Default version updated 2026-05-02 to phase1batch-v1
+    (the current cohort schema; audit-v6 was overwritten during Phase 1 regen).
+    `lit_2019_subset()` selects features by name so Phase 1 cols are filtered
+    out automatically downstream — no explicit drop needed here.
+    """
     files = [f for f in sorted(features_dir.glob("*.parquet"))
              if f.name != "subject_metadata.parquet"]
     if not files:
@@ -128,6 +133,8 @@ def load_cohort(features_dir: Path, version: str = "2026-04-26-audit-v6") -> pd.
     df = df[df["features_version"] == version].reset_index(drop=True)
     n_after = df["subject_id"].nunique()
     print(f"  features_version filter: {version!r} → {n_after}/{n_before} subjects")
+    if n_after == 0:
+        raise SystemExit(f"No subjects matched features_version={version!r}.")
 
     n_epochs_before = len(df)
     mask = sleep_mask(df.sleep_stage.values)
@@ -170,7 +177,7 @@ def subject_bootstrap(df_test, probs, n_resamples=1000, seed=42):
 
 
 @click.command()
-@click.option("--features-version", default="2026-04-26-audit-v6", show_default=True)
+@click.option("--features-version", default="2026-05-01-phase1batch-v1", show_default=True)
 @click.option("--seed", type=int, default=42, show_default=True)
 def main(features_version: str, seed: int) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)

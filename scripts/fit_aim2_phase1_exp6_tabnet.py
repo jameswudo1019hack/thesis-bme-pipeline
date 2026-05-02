@@ -84,7 +84,29 @@ NON_FEATURE = {
 }
 
 
-def load_cohort(features_dir: Path, version: str = "2026-04-26-audit-v6") -> pd.DataFrame:
+# Phase 1 cols (added 2026-05-01) — drop to recover audit-v6 schema for the
+# original TabNet vs LightGBM comparison. Same drop list as v85_taxonomy.
+_PHASE1_NEW_BASE_COLS = (
+    "spo2_sampen", "hrv_sampen",
+    "spo2_psd_apnea_band", "spo2_psd_total", "spo2_psd_apnea_ratio",
+    "cpc_amp_cv", "cpc_amp_iqr",
+    "ecg_band_low_power", "ecg_band_mid_low_power", "ecg_band_mid_power",
+    "ecg_band_mid_high_power", "ecg_band_high_power", "ecg_band_total_power",
+    "ecg_band_low_rel", "ecg_band_mid_low_rel", "ecg_band_mid_rel",
+    "ecg_band_mid_high_rel", "ecg_band_high_rel",
+)
+_PHASE1_DROP_SUFFIXES = ("", "_lag1", "_lead1", "_roll5_mean", "_roll5_std", "_roll11_mean", "_roll11_std")
+
+
+def _phase1_drop_set(all_cols: list[str]) -> set[str]:
+    targets = {b + s for b in _PHASE1_NEW_BASE_COLS for s in _PHASE1_DROP_SUFFIXES}
+    return {c for c in all_cols if c in targets}
+
+
+def load_cohort(features_dir: Path, version: str = "2026-05-01-phase1batch-v1") -> pd.DataFrame:
+    """Default version updated 2026-05-02 to phase1batch-v1 (current cohort schema).
+    Phase 1 cols are dropped at fit time to recover audit-v6 273-col subset.
+    """
     files = [
         f for f in sorted(features_dir.glob("*.parquet"))
         if f.name != "subject_metadata.parquet" and not f.name.startswith("._")
@@ -116,6 +138,13 @@ def load_cohort(features_dir: Path, version: str = "2026-04-26-audit-v6") -> pd.
     df = df[df["features_version"] == version].reset_index(drop=True)
     n_after = df["subject_id"].nunique()
     print(f"  features_version filter: {version!r} → {n_after}/{n_before} subjects")
+    if n_after == 0:
+        raise SystemExit(f"No subjects matched features_version={version!r}.")
+
+    p1_drop = _phase1_drop_set(list(df.columns))
+    if p1_drop:
+        df = df.drop(columns=sorted(p1_drop))
+        print(f"  dropped {len(p1_drop)} Phase 1 cols to recover audit-v6 schema")
 
     n_epochs_before = len(df)
     mask = sleep_mask(df.sleep_stage.values)
