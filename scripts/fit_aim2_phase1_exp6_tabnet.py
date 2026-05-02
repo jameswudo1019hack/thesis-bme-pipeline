@@ -25,7 +25,7 @@ LightGBM due to less data per parameter. Predicted ranges (sleep-only):
 Protocol
 --------
 Same as 8.5-tax / Phase 1 Exp 5 (canonical sleep-only):
-  - sleep-only filter via wake_mask (drops ~28.8% wake epochs)
+  - sleep-only filter via sleep_mask (keeps ~71.2% sleep epochs)
   - GroupShuffleSplit(test_size=0.2, random_state=42) — IDENTICAL test set
   - Inner train/val for early stopping (5% of TV pool)
   - Median imputation + StandardScaler (TabNet doesn't handle NaN natively)
@@ -72,7 +72,7 @@ from sklearn.preprocessing import StandardScaler
 CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
-from thesis_pipeline.epochs import wake_mask  # noqa: E402
+from thesis_pipeline.epochs import sleep_mask  # noqa: E402
 from thesis_pipeline.extended_metrics import write_extended_metrics  # noqa: E402
 from thesis_pipeline.feature_groups import feature_subset, split_features  # noqa: E402
 
@@ -118,8 +118,11 @@ def load_cohort(features_dir: Path, version: str = "2026-04-26-audit-v6") -> pd.
     print(f"  features_version filter: {version!r} → {n_after}/{n_before} subjects")
 
     n_epochs_before = len(df)
-    mask = wake_mask(df.sleep_stage.values)
-    df = df[~mask].reset_index(drop=True)
+    mask = sleep_mask(df.sleep_stage.values)
+    df = df[mask].reset_index(drop=True)
+    assert df["sleep_stage"].isin(["N1", "N2", "N3", "REM"]).all(), (
+        f"sleep filter failed: found stages {sorted(df['sleep_stage'].unique())} after filter"
+    )
     print(f"  sleep-only filter: kept {len(df):,}/{n_epochs_before:,} epochs ({100*len(df)/n_epochs_before:.1f}%)")
     return df
 
@@ -274,6 +277,7 @@ def fit_one_config(name: str, df: pd.DataFrame, feature_cols: list[str],
         "name": name,
         "experiment": "phase1_exp6_tabnet",
         "model": "TabNet",
+        "filter_used": "sleep-only",
         "n_features": len(feature_cols),
         "n_test_subjects": int(len(np.unique(groups[test_idx]))),
         "n_test_epochs": int(len(test_idx)),

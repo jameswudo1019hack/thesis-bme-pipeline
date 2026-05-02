@@ -21,7 +21,7 @@ literature features, there's a methodological problem we missed.
 Protocol
 --------
 Same as the v8.5 taxonomy ablation:
-  - sleep-only filter (audit-v6 wake_mask)
+  - sleep-only filter (audit-v6 sleep_mask)
   - GroupShuffleSplit(test_size=0.2, random_state=42) — IDENTICAL test set
     to v6 / v8 / v8.5 / 8.5-tax for paired comparisons
   - Inner train/val for early stopping (5% of TV pool)
@@ -64,7 +64,7 @@ from sklearn.model_selection import GroupShuffleSplit
 CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
-from thesis_pipeline.epochs import wake_mask  # noqa: E402
+from thesis_pipeline.epochs import sleep_mask  # noqa: E402
 from thesis_pipeline.extended_metrics import write_extended_metrics  # noqa: E402
 from thesis_pipeline.literature_baselines import (  # noqa: E402
     LIT_2019_BASE_FEATURES,
@@ -130,8 +130,11 @@ def load_cohort(features_dir: Path, version: str = "2026-04-26-audit-v6") -> pd.
     print(f"  features_version filter: {version!r} → {n_after}/{n_before} subjects")
 
     n_epochs_before = len(df)
-    mask = wake_mask(df.sleep_stage.values)
-    df = df[~mask].reset_index(drop=True)
+    mask = sleep_mask(df.sleep_stage.values)
+    df = df[mask].reset_index(drop=True)
+    assert df["sleep_stage"].isin(["N1", "N2", "N3", "REM"]).all(), (
+        f"sleep filter failed: found stages {sorted(df['sleep_stage'].unique())} after filter"
+    )
     print(f"  sleep-only filter: kept {len(df):,}/{n_epochs_before:,} epochs ({100*len(df)/n_epochs_before:.1f}%)")
     return df
 
@@ -294,6 +297,7 @@ def main(features_version: str, seed: int) -> None:
     metrics = {
         "name": "lit_2019",
         "description": "Literature-comparable baseline approximating the median 2018-2020 SHHS apnoea-detection ML paper feature set",
+        "filter_used": "sleep-only",
         "n_features": len(lit_features),
         "n_features_defined": len(LIT_2019_BASE_FEATURES),
         "n_features_missing": len(missing),

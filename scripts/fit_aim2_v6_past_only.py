@@ -62,7 +62,7 @@ from sklearn.model_selection import GroupShuffleSplit
 CODE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE_ROOT))
 
-from thesis_pipeline.epochs import wake_mask  # noqa: E402
+from thesis_pipeline.epochs import sleep_mask  # noqa: E402
 from thesis_pipeline.extended_metrics import write_extended_metrics  # noqa: E402
 
 FEATURES_DIR = CODE_ROOT / "features"
@@ -238,10 +238,13 @@ def load_cohort(features_dir: Path, version: str, match_v6_schema: bool,
 
 
 def apply_sleep_filter(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply wake_mask AFTER past-only rolling has been computed on the full sequence."""
+    """Keep SLEEP epochs (sleep_mask returns True for N1/N2/N3/REM)."""
     n_before = len(df)
-    mask = wake_mask(df.sleep_stage.values)
-    df = df[~mask].reset_index(drop=True)
+    mask = sleep_mask(df.sleep_stage.values)
+    df = df[mask].reset_index(drop=True)
+    assert df["sleep_stage"].isin(["N1", "N2", "N3", "REM"]).all(), (
+        f"sleep filter failed: found stages {sorted(df['sleep_stage'].unique())} after filter"
+    )
     print(f"  sleep-only filter: kept {len(df):,}/{n_before:,} epochs ({100*len(df)/n_before:.1f}%)")
     return df
 
@@ -471,6 +474,7 @@ def main(features_version: str, seed: int, match_v6_schema: bool, include_future
     metrics = {
         "name": out_dir.name,
         "model": "lightgbm",
+        "filter_used": "sleep-only",
         "features_version": features_version,
         "match_v6_schema": match_v6_schema,
         "include_future_context": include_future_context,

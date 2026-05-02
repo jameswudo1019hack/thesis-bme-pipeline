@@ -24,7 +24,7 @@ VAULT_DIR = CODE_ROOT.parent / "Thesis Vault"
 OUT_PATH = VAULT_DIR / "Aims" / "_metrics_registry.csv"
 
 COLUMNS = [
-    "run_id", "date", "model",
+    "run_id", "date", "model", "filter_used",
     "n_features",
     "cv_auc_mean", "cv_auc_std",
     "test_auc", "test_auc_ci_low", "test_auc_ci_high",
@@ -47,6 +47,28 @@ def _load_json(path: Path) -> dict | None:
         return None
 
 
+def _infer_filter_used(model_dir: Path) -> str | None:
+    """For old runs without explicit filter_used field, infer from run_id naming.
+
+    Returns None if uninferable; the registry row will have an empty cell which
+    makes the legacy-vs-recovered split visible at a glance.
+    """
+    name = str(model_dir).lower()
+    if "phase1_exp5_sleep_stage" in name:
+        return "all-stages"
+    if any(tag in name for tag in ("aim2_cv_v4", "aim2_cv_v5", "aim2_cv_v6", "aim2_cv_v7")):
+        return "sleep-only"
+    if any(tag in name for tag in ("v85_taxonomy", "lit_2019", "phase1_batch", "phase1_exp6_tabnet", "v6_past_only", "v6_future_inclusive")):
+        # Pre-recovery these were wake-only-bug; post-recovery they're sleep-only.
+        # Without a metrics.json field, we can't tell — return None and let the
+        # downstream user mark manually.
+        return None
+    if name.endswith(("v8_xgboost", "v8_catboost", "v8_logreg", "v8_rf", "v8_ensemble")):
+        # Original v8 series had no filter at all
+        return "all-stages-bug"
+    return None
+
+
 def _row_for(model_dir: Path) -> dict | None:
     ext = _load_json(model_dir / "metrics_extended.json")
     basic = _load_json(model_dir / "metrics.json")
@@ -67,6 +89,7 @@ def _row_for(model_dir: Path) -> dict | None:
         "run_id": str(model_dir.relative_to(MODELS_DIR)),
         "date": datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y-%m-%d"),
         "model": data.get("model"),
+        "filter_used": data.get("filter_used") or _infer_filter_used(model_dir),
         "n_features": n_features,
         "cv_auc_mean": data.get("cv_mean_auc"),
         "cv_auc_std": data.get("cv_std_auc"),

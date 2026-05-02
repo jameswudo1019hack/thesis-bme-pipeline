@@ -46,7 +46,7 @@ from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from thesis_pipeline.epochs import wake_mask
+from thesis_pipeline.epochs import sleep_mask
 
 NON_FEATURE_COLS = {
     "subject_id",
@@ -211,8 +211,11 @@ def main(trials: int, timeout: int, k: int, seed: int, features_version: str | N
         print(f"  features_version filter: {features_version!r} → {n_after} of {n_before} subjects")
     if sleep_only:
         n_before = len(df)
-        mask = wake_mask(df.sleep_stage.values)
+        mask = sleep_mask(df.sleep_stage.values)
         df = df.loc[mask].reset_index(drop=True)
+        assert df["sleep_stage"].isin(["N1", "N2", "N3", "REM"]).all(), (
+            f"sleep filter failed: found stages {sorted(df['sleep_stage'].unique())} after filter"
+        )
         click.echo(f"Sleep-only filter: kept {len(df)}/{n_before} epochs ({100*len(df)/n_before:.1f}%)")
     feature_cols = [c for c in df.columns if c not in NON_FEATURE_COLS]
     print(f"  {len(df):,} epochs, {df['subject_id'].nunique()} subjects, {len(feature_cols)} features")
@@ -336,6 +339,7 @@ def main(trials: int, timeout: int, k: int, seed: int, features_version: str | N
     model.booster_.save_model(str(out_dir /"model.txt"))
 
     metrics = {
+        "filter_used": "sleep-only" if sleep_only else "all-stages",
         "cv_mean_auc": mean_auc,
         "cv_std_auc": std_auc,
         "cv_best_value_optuna": best_mean_auc,

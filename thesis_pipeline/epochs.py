@@ -55,8 +55,8 @@ def align_hypnogram(hypno: Hypnogram, n_epochs: int) -> np.ndarray:
     return stages[:n_epochs]
 
 
-def wake_mask(stages: np.ndarray) -> np.ndarray:
-    """Boolean mask for sleep epochs.
+def sleep_mask(stages: np.ndarray) -> np.ndarray:
+    """Boolean mask for **sleep epochs** — use as ``df[sleep_mask(stages)]`` to KEEP sleep.
 
     Returns True for AASM sleep stages (N1, N2, N3, REM); False for wake
     ("W") and unknown ("?"). Use this to filter training/evaluation sets
@@ -74,9 +74,33 @@ def wake_mask(stages: np.ndarray) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        Boolean array, length == len(stages).
+        Boolean array, length == len(stages). True where stage ∈ {N1, N2, N3, REM}.
     """
     return np.isin(np.asarray(stages, dtype=object), ["N1", "N2", "N3", "REM"])
+
+
+def wake_mask(stages: np.ndarray) -> np.ndarray:
+    """DEPRECATED: misleadingly named — returns True for SLEEP epochs (not wake).
+
+    Kept for backwards compatibility with code that does
+    ``df.loc[wake_mask(stages)]`` (correct: keeps sleep) — that pattern relies
+    on the historical True-for-sleep behaviour.
+
+    New code should prefer :func:`sleep_mask` (semantically clearer name; same
+    return value).
+
+    Parameters
+    ----------
+    stages : np.ndarray
+        Per-epoch sleep stage labels.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean array, length == len(stages). True where stage ∈ {N1, N2, N3, REM}.
+        IDENTICAL to ``sleep_mask(stages)``.
+    """
+    return sleep_mask(stages)
 
 
 def subject_metadata(epoch_frame: "pd.DataFrame") -> dict[str, float]:
@@ -114,11 +138,15 @@ def subject_metadata(epoch_frame: "pd.DataFrame") -> dict[str, float]:
     n_epochs = len(epoch_frame)
     tib_min = n_epochs * 30 / 60.0
 
-    sleep_mask = wake_mask(epoch_frame["sleep_stage"].values)
-    tst_min = float(sleep_mask.sum() * 30 / 60.0)
+    mask_sleep = sleep_mask(epoch_frame["sleep_stage"].values)
+    # Defensive: catch future renames that silently invert this mask
+    assert mask_sleep.dtype == bool and len(mask_sleep) == n_epochs, (
+        "sleep_mask returned unexpected shape/dtype"
+    )
+    tst_min = float(mask_sleep.sum() * 30 / 60.0)
 
-    if sleep_mask.any():
-        first_sleep = int(np.argmax(sleep_mask))
+    if mask_sleep.any():
+        first_sleep = int(np.argmax(mask_sleep))
         post_onset = epoch_frame.iloc[first_sleep:]
         waso_min = float((post_onset["sleep_stage"] == "W").sum() * 30 / 60.0)
     else:
