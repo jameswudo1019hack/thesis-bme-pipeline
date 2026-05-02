@@ -337,7 +337,7 @@ def fit_one_config(name: str, df: pd.DataFrame, feature_cols: list[str],
 
 
 @click.command()
-@click.option("--features-version", default="2026-04-26-audit-v6", show_default=True)
+@click.option("--features-version", default="2026-05-01-phase1batch-v1", show_default=True)
 @click.option("--seed", type=int, default=42, show_default=True)
 @click.option("--device", default="auto", show_default=True,
               help="'auto' picks cuda if available; or pass 'cuda'/'cpu' explicitly")

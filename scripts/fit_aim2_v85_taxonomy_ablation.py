@@ -339,7 +339,7 @@ def fit_one_config(
 
 
 @click.command()
-@click.option("--features-version", default="2026-04-26-audit-v6", show_default=True)
+@click.option("--features-version", default="2026-05-01-phase1batch-v1", show_default=True)
 @click.option("--seed", type=int, default=42, show_default=True,
               help="MUST be 42 to keep test split identical to v6 / v8 / v8.5 for paired tests")
 def main(features_version: str, seed: int) -> None:
