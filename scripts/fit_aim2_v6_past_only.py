@@ -82,10 +82,9 @@ ALL_DERIVATIVE_SUFFIXES = FUTURE_LEAKING_SUFFIXES + PAST_KEPT_SUFFIXES
 PAST_ROLL_WINDOWS = (5, 11)
 
 # Pre-reg specifies audit-v6 feature subset. The local cohort is now on
-# phase1batch-v1 (which is a superset of audit-v6). To honour the pre-reg, we
-# drop the Phase 1 NEW base columns + their contextual derivatives at fit time
-# to recover the audit-v6 feature set. This is documented in the pre-reg
-# operational deviation appendix.
+# phase1batch-v1 (a superset of audit-v6). At fit time we drop the Phase 1
+# NEW base columns + their contextual derivatives to recover the audit-v6
+# feature set. Documented in the pre-reg operational-deviation appendix.
 PHASE1_NEW_BASE_COLS = (
     # Exp 1
     "spo2_sampen", "hrv_sampen",
@@ -99,12 +98,37 @@ PHASE1_NEW_BASE_COLS = (
     "ecg_band_low_rel", "ecg_band_mid_low_rel", "ecg_band_mid_rel",
     "ecg_band_mid_high_rel", "ecg_band_high_rel",
 )
+
+# Sprint 1 (2026-04-26) added these 10 base cols on top of the original
+# 29-base aim2_cv_v6 schema: 4 freq-HRV + 1 hypoxic-burden + 5 position.
+# The --match-v6-schema flag drops these too, recovering the EXACT
+# 29-base × 7-suffix = 203-col schema aim2_cv_v6 was trained on. This is the
+# proper paired comparator for the original "v6 contextual lift" question.
+SPRINT1_NEW_BASE_COLS = (
+    # T3 frequency-HRV
+    "hrv_lf_power", "hrv_hf_power", "hrv_lf_hf_ratio", "hrv_total_power_freq",
+    # T4 hypoxic burden
+    "hypoxic_burden_epoch",
+    # T5 position
+    "position_right_frac", "position_left_frac", "position_supine_frac",
+    "position_prone_frac", "position_upright_frac",
+)
+
 ALL_SUFFIXES_INCLUDING_BASE = ("",) + ALL_DERIVATIVE_SUFFIXES
 
 
+def _expand_drop_list(base_cols: tuple[str, ...]) -> set[str]:
+    """Expand base col names to {base, base_lag1, base_lead1, base_roll5_mean, ...}."""
+    return {base + sfx for base in base_cols for sfx in ALL_SUFFIXES_INCLUDING_BASE}
+
+
 def phase1_columns_to_drop(all_cols: list[str]) -> list[str]:
-    """All Phase 1 base cols + their lag1/lead1/roll* derivatives, present in cohort."""
-    targets = {base + sfx for base in PHASE1_NEW_BASE_COLS for sfx in ALL_SUFFIXES_INCLUDING_BASE}
+    targets = _expand_drop_list(PHASE1_NEW_BASE_COLS)
+    return sorted(c for c in all_cols if c in targets)
+
+
+def sprint1_columns_to_drop(all_cols: list[str]) -> list[str]:
+    targets = _expand_drop_list(SPRINT1_NEW_BASE_COLS)
     return sorted(c for c in all_cols if c in targets)
 
 FIXED_PARAMS = {
@@ -139,23 +163,61 @@ def find_base_features(all_cols: list[str], non_feature: set[str]) -> list[str]:
     return sorted(c for c in all_cols if c not in non_feature and not is_derivative(c))
 
 
-def load_cohort(features_dir: Path, version: str) -> pd.DataFrame:
-    """Load all per-subject parquets, filter to features_version + sleep epochs."""
+def _compute_keep_columns(probe_path: Path, match_v6_schema: bool, include_future_context: bool) -> list[str]:
+    """Probe one parquet to determine which columns to load.
+
+    Always drops: Phase 1 cols (recovers audit-v6).
+    Optionally drops Sprint 1 cols when match_v6_schema=True, recovering the
+    exact 203-col aim2_cv_v6 schema.
+    Optionally KEEPS _lead1 + centred _roll* when include_future_context=True
+    (matched future-inclusive baseline run; no past-only recomputation needed).
+    """
+    head = pd.read_parquet(probe_path)
+    cols = list(head.columns)
+    keep_meta = {"subject_id", "epoch_idx", "apnoea_label", "features_version", "sleep_stage"}
+    p1_drop = set(phase1_columns_to_drop(cols))
+    s1_drop = set(sprint1_columns_to_drop(cols)) if match_v6_schema else set()
+
+    keep: list[str] = []
+    for c in cols:
+        if c in keep_meta:
+            keep.append(c)
+            continue
+        if c in p1_drop or c in s1_drop:
+            continue
+        if not include_future_context and any(c.endswith(s) for s in FUTURE_LEAKING_SUFFIXES):
+            continue
+        keep.append(c)
+    return keep
+
+
+def load_cohort(features_dir: Path, version: str, match_v6_schema: bool,
+                include_future_context: bool) -> pd.DataFrame:
+    """Load needed columns per parquet, filter to features_version. NO sleep filter here.
+
+    Sleep filter is applied LATER, after past-only rolling is computed on the
+    full PSG sequence (so rolling windows respect real-time epoch order rather
+    than jumping over wake periods).
+    """
     files = [
         f for f in sorted(features_dir.glob("shhs1-*.parquet"))
         if not f.name.startswith("._")
     ]
     if not files:
         raise FileNotFoundError(f"No per-subject parquet files in {features_dir}")
-    print(f"  loading {len(files)} parquet files...")
+
+    keep_cols = _compute_keep_columns(files[0], match_v6_schema=match_v6_schema,
+                                      include_future_context=include_future_context)
+    total_cols = len(pd.read_parquet(files[0]).columns)
+    print(f"  loading {len(files)} parquet files "
+          f"(reading {len(keep_cols)}/{total_cols} cols/file; "
+          f"match_v6_schema={match_v6_schema}, future_context={include_future_context})...")
 
     KEEP_META = {"subject_id", "epoch_idx", "apnoea_label", "features_version", "sleep_stage"}
-    DROP_META = {"cohort", "epoch_start_sec"}
 
     frames = []
     for f in files:
-        df = pd.read_parquet(f)
-        df = df.drop(columns=[c for c in DROP_META if c in df.columns], errors="ignore")
+        df = pd.read_parquet(f, columns=keep_cols)
         for c in df.columns:
             if c in KEEP_META:
                 continue
@@ -171,12 +233,16 @@ def load_cohort(features_dir: Path, version: str) -> pd.DataFrame:
     n_before = df["subject_id"].nunique()
     df = df[df["features_version"] == version].reset_index(drop=True)
     n_after = df["subject_id"].nunique()
-    print(f"  features_version filter: {version!r} → {n_after}/{n_before} subjects")
+    print(f"  features_version filter: {version!r} → {n_after}/{n_before} subjects ({len(df):,} pre-filter epochs)")
+    return df
 
-    n_epochs_before = len(df)
+
+def apply_sleep_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply wake_mask AFTER past-only rolling has been computed on the full sequence."""
+    n_before = len(df)
     mask = wake_mask(df.sleep_stage.values)
     df = df[~mask].reset_index(drop=True)
-    print(f"  sleep-only filter: kept {len(df):,}/{n_epochs_before:,} epochs ({100*len(df)/n_epochs_before:.1f}%)")
+    print(f"  sleep-only filter: kept {len(df):,}/{n_before:,} epochs ({100*len(df)/n_before:.1f}%)")
     return df
 
 
@@ -241,55 +307,67 @@ def subject_bootstrap(
     }
 
 
+def _resolve_out_dir(match_v6_schema: bool, include_future_context: bool) -> Path:
+    suffix_schema = "_strict" if match_v6_schema else ""
+    if include_future_context:
+        return CODE_ROOT / "models" / f"aim2_v6_future_inclusive{suffix_schema}"
+    return CODE_ROOT / "models" / f"aim2_v6_past_only{suffix_schema}"
+
+
 @click.command()
 @click.option("--features-version", default="2026-05-01-phase1batch-v1", show_default=True,
               help="Local cohort is on phase1batch-v1 (superset of audit-v6). Phase 1 cols "
-                   "are dropped at fit time to recover the audit-v6 feature set per pre-reg.")
+                   "are always dropped at fit time to recover the audit-v6 feature set.")
 @click.option("--seed", type=int, default=42, show_default=True,
               help="MUST be 42 to keep test split identical to v6 / v7 / v8.5-tax for paired tests")
-def main(features_version: str, seed: int) -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+@click.option("--match-v6-schema", is_flag=True,
+              help="Also drop Sprint 1 cols (freq-HRV, hypoxic_burden, position) to recover "
+                   "the exact 29-base × 7-suffix = 203-col aim2_cv_v6 schema.")
+@click.option("--include-future-context", is_flag=True,
+              help="KEEP _lead1 and centred _roll* columns; SKIP past-only rolling. "
+                   "Use to fit the matched future-inclusive baseline on the same "
+                   "5,793-subject + seed=42 cohort, enabling valid paired bootstrap.")
+def main(features_version: str, seed: int, match_v6_schema: bool, include_future_context: bool) -> None:
+    out_dir = _resolve_out_dir(match_v6_schema, include_future_context)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=== Aim 2 — v6 past-only context ===")
+    schema_tag = "strict v6 schema" if match_v6_schema else "audit-v6 schema"
+    ctx_tag = "future-inclusive" if include_future_context else "past-only"
+    print(f"\n=== Aim 2 — v6 {ctx_tag} context ({schema_tag}) ===")
     print(f"  Features dir: {FEATURES_DIR}")
-    print(f"  Output dir:   {OUT_DIR}")
+    print(f"  Output dir:   {out_dir}")
     print(f"  Features version: {features_version}")
-    print(f"  Seed: {seed}\n")
+    print(f"  Seed: {seed}")
+    print(f"  Match v6 schema: {match_v6_schema}")
+    print(f"  Include future context: {include_future_context}")
+    print()
 
-    df = load_cohort(FEATURES_DIR, version=features_version)
+    df = load_cohort(FEATURES_DIR, version=features_version,
+                     match_v6_schema=match_v6_schema,
+                     include_future_context=include_future_context)
     feature_cols_all = [c for c in df.columns if c not in NON_FEATURE]
-    print(f"  Total features (loaded schema): {len(feature_cols_all)}")
-
-    # Recover audit-v6 feature subset by dropping Phase 1 cols + derivatives
-    # (pre-reg compliance — keeps comparison axis clean against v6/v7).
-    p1_drop = phase1_columns_to_drop(list(df.columns))
-    if p1_drop:
-        print(f"  Dropping {len(p1_drop)} Phase 1 columns to recover audit-v6 schema "
-              f"(spo2_sampen / hrv_sampen / *_psd / cpc_* / ecg_band_*)")
-        df = df.drop(columns=p1_drop)
-        feature_cols_all = [c for c in df.columns if c not in NON_FEATURE]
-        print(f"  Audit-v6-equivalent feature count: {len(feature_cols_all)}")
-
-    # Identify base features and verify schema looks right
     base_cols = find_base_features(list(df.columns), NON_FEATURE)
     n_lag1 = sum(1 for c in feature_cols_all if c.endswith("_lag1"))
     n_lead1 = sum(1 for c in feature_cols_all if c.endswith("_lead1"))
     n_roll = sum(1 for c in feature_cols_all if any(c.endswith(s) for s in ("_roll5_mean", "_roll5_std", "_roll11_mean", "_roll11_std")))
-    print(f"  Schema breakdown: {len(base_cols)} base, {n_lag1} _lag1, {n_lead1} _lead1, {n_roll} _roll*")
+    print(f"  Loaded schema: {len(base_cols)} base + {n_lag1} _lag1 + {n_lead1} _lead1 + {n_roll} _roll* = {len(feature_cols_all)} cols")
     assert len(base_cols) > 0, "No base features identified — check schema"
-    assert n_lag1 == len(base_cols), f"_lag1 count {n_lag1} != base count {len(base_cols)} — schema unexpected"
-    assert n_lead1 == len(base_cols), f"_lead1 count {n_lead1} != base count {len(base_cols)} — schema unexpected"
+    assert n_lag1 == len(base_cols), f"_lag1 count {n_lag1} != base count {len(base_cols)}"
+    if include_future_context:
+        assert n_lead1 == len(base_cols), f"_lead1 count {n_lead1} != base count {len(base_cols)}"
+        assert n_roll == 4 * len(base_cols), f"_roll count {n_roll} != 4 × base count {4 * len(base_cols)}"
 
-    # Drop future-leaking columns
-    drop_cols = [c for c in feature_cols_all if is_future_leaking(c)]
-    print(f"  Dropping {len(drop_cols)} future-leaking columns (_lead1 + _roll*)")
-    df = df.drop(columns=drop_cols)
+    # Past-only mode: recompute right-aligned rolling on FULL PSG sequence
+    # (BEFORE sleep filter — matches v6's extraction-time methodology where
+    # rolling spans wake/sleep transitions naturally).
+    if not include_future_context:
+        df = add_past_only_rolling(df, base_cols, windows=PAST_ROLL_WINDOWS)
 
-    # Recompute past-only rolling features at fit time
-    df = add_past_only_rolling(df, base_cols, windows=PAST_ROLL_WINDOWS)
+    # Sleep filter applied AFTER rolling so windows respect real-time epoch order
+    df = apply_sleep_filter(df)
 
     feature_cols = [c for c in df.columns if c not in NON_FEATURE]
-    print(f"  Past-only feature count: {len(feature_cols)}\n")
+    print(f"  Final feature count ({ctx_tag}): {len(feature_cols)}\n")
 
     # Outer split — IDENTICAL to all v6 / v7 / v8.5-tax / Phase 1 work
     X_dummy = np.empty(len(df))
@@ -358,14 +436,17 @@ def main(features_version: str, seed: int) -> None:
     print(f"  AUC subject CI:    [{ci['auc_ci_low']:.4f}, {ci['auc_ci_high']:.4f}]")
     print(f"  AUC-PR subject CI: [{ci['aupr_ci_low']:.4f}, {ci['aupr_ci_high']:.4f}]")
 
-    # Pre-registered outcome interpretation
-    print(f"\n  Pre-registered outcome interpretation:")
-    if test_auc >= 0.840:
-        print(f"    SURVIVAL — past-only AUC {test_auc:.4f} ≥ 0.840: v6 lift is real-time deployable")
-    elif test_auc >= 0.800:
-        print(f"    MIXED — past-only AUC {test_auc:.4f} in [0.800, 0.840): both past + future contribute")
+    # Pre-registered outcome interpretation (only meaningful for past-only runs)
+    if not include_future_context:
+        print(f"\n  Pre-registered outcome interpretation:")
+        if test_auc >= 0.840:
+            print(f"    SURVIVAL — past-only AUC {test_auc:.4f} ≥ 0.840: v6 lift is real-time deployable")
+        elif test_auc >= 0.800:
+            print(f"    MIXED — past-only AUC {test_auc:.4f} in [0.800, 0.840): both past + future contribute")
+        else:
+            print(f"    COLLAPSE — past-only AUC {test_auc:.4f} < 0.800: v6 lift was substantially future-leakage")
     else:
-        print(f"    COLLAPSE — past-only AUC {test_auc:.4f} < 0.800: v6 lift was substantially future-leakage")
+        print(f"\n  (future-inclusive run — pre-reg verdict applies to past-only only)")
 
     # Save artifacts
     test_pred_df = pd.DataFrame({
@@ -375,22 +456,24 @@ def main(features_version: str, seed: int) -> None:
         "pred_prob": probs,
         "pred_label": preds,
     })
-    test_pred_df.to_parquet(OUT_DIR / "test_predictions.parquet", index=False)
-    np.save(OUT_DIR / "bootstrap_aucs_subject.npy", aucs)
-    np.save(OUT_DIR / "bootstrap_auprs_subject.npy", auprs)
-    (OUT_DIR / "feature_list.json").write_text(json.dumps(feature_cols, indent=2))
+    test_pred_df.to_parquet(out_dir / "test_predictions.parquet", index=False)
+    np.save(out_dir / "bootstrap_aucs_subject.npy", aucs)
+    np.save(out_dir / "bootstrap_auprs_subject.npy", auprs)
+    (out_dir / "feature_list.json").write_text(json.dumps(feature_cols, indent=2))
 
     try:
         sm_path = FEATURES_DIR / "subject_metadata.parquet"
         sm = pd.read_parquet(sm_path) if sm_path.exists() else None
-        write_extended_metrics(OUT_DIR, test_pred_df, subject_metadata=sm)
+        write_extended_metrics(out_dir, test_pred_df, subject_metadata=sm)
     except Exception as _e:
         print(f"  ! extended metrics failed: {_e}")
 
     metrics = {
-        "name": "v6_past_only",
+        "name": out_dir.name,
         "model": "lightgbm",
         "features_version": features_version,
+        "match_v6_schema": match_v6_schema,
+        "include_future_context": include_future_context,
         "n_features": len(feature_cols),
         "n_test_subjects": int(len(np.unique(groups_arr[test_idx]))),
         "n_test_epochs": int(len(test_idx)),
@@ -410,8 +493,8 @@ def main(features_version: str, seed: int) -> None:
         "fit_seconds": fit_time,
         "preregistration_note": "Vault: Experiments/2026-04-30 - v6 past-only context (pre-registration).md",
     }
-    (OUT_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    print(f"\n  saved → {OUT_DIR}")
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    print(f"\n  saved → {out_dir}")
 
 
 if __name__ == "__main__":
