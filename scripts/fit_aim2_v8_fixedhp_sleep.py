@@ -37,6 +37,7 @@ import pandas as pd
 import xgboost as xgb
 from catboost import CatBoostClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
@@ -199,6 +200,7 @@ def _build_xgboost(spw: float) -> xgb.XGBClassifier:
         random_state=42,
         tree_method="hist",
         scale_pos_weight=spw,
+        early_stopping_rounds=FIXED_EARLY_STOPPING,
     )
 
 
@@ -230,6 +232,7 @@ def _build_rf() -> RandomForestClassifier:
 
 def _build_logreg() -> Pipeline:
     return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(class_weight="balanced", max_iter=1000)),
     ])
@@ -417,7 +420,6 @@ def fit_one_model(
                 X[tr], y[tr],
                 eval_set=[(X[va], y[va])],
                 verbose=False,
-                early_stopping_rounds=FIXED_EARLY_STOPPING,
             )
             best_iter = int(model.best_iteration) if model.best_iteration is not None else FIXED_N_ESTIMATORS
 
