@@ -130,6 +130,11 @@ def main() -> None:
     for model_dir in sorted(MODELS_DIR.rglob("*")):
         if not model_dir.is_dir():
             continue
+        # Skip archived (pre-recovery wake-bug-affected) dirs and any other
+        # underscore-prefixed scratch dirs at any depth.
+        rel = model_dir.relative_to(MODELS_DIR)
+        if any(part.startswith("_") for part in rel.parts):
+            continue
         if not (model_dir / "metrics.json").exists() and not (model_dir / "metrics_extended.json").exists():
             continue
         row = _row_for(model_dir)
