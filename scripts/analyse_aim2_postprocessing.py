@@ -255,6 +255,34 @@ def agreement(est: np.ndarray, ref: np.ndarray) -> dict:
     }
 
 
+def plot_t1(per: pd.DataFrame, out_dir: Path, run: str = "full") -> None:
+    """Three Bland-Altman panels for one run: the old comparison, the like-for-like one, run collapse."""
+    p = per[per["run"] == run]
+    panels = [
+        ("epoch_proxy_pred", "ahi_a0h3a", "(a) Epoch count vs NSRR ahi_a0h3a\n(old metric: different event definition)"),
+        ("epoch_proxy_pred", "xml_ahi", "(b) Epoch count vs scored events\n(same event definition as the labels)"),
+        ("run_pred", "xml_ahi", "(c) Run collapse vs scored events\n(merges back-to-back events)"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), sharey=True)
+    for ax, (est, ref, title) in zip(axes, panels):
+        q = p[[est, ref]].dropna()
+        m = (q[est] + q[ref]) / 2
+        d = q[est] - q[ref]
+        ax.scatter(m, d, s=5, alpha=0.35)
+        ax.axhline(0, color="grey", lw=0.8)
+        ax.axhline(d.mean(), color="k", label=f"bias {d.mean():+.1f}")
+        for sgn in (-1, 1):
+            ax.axhline(d.mean() + sgn * 1.96 * d.std(), ls="--", color="grey")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("mean of estimate and reference (events/h)")
+        ax.legend(fontsize=8, loc="lower left")
+    axes[0].set_ylabel("estimate - reference (events/h)")
+    fig.suptitle(f"{run} model: per-subject event index agreement, {p.shape[0]:,} test subjects", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"t1_bland_altman_{run}.png", dpi=150)
+    plt.close(fig)
+
+
 def run_events(preds: dict, subj: pd.DataFrame, out_dir: Path, n_boot: int) -> dict:
     print("\n=== T1 event-run post-processing ===")
     rows = []
@@ -317,23 +345,7 @@ def run_events(preds: dict, subj: pd.DataFrame, out_dir: Path, n_boot: int) -> d
     }
     (out_dir / "t1_events.json").write_text(json.dumps(out, indent=2))
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    p = per[per["run"] == "full"].loc[subjects]
-    for ax, (est, ref, title) in zip(axes, [("epoch_proxy_pred", "ahi_a0h3a", "Old: epoch proxy vs NSRR ahi_a0h3a"),
-                                             ("run_pred", "xml_ahi", "New: event runs vs scored XML events")]):
-        m = (p[est] + p[ref]) / 2
-        d = p[est] - p[ref]
-        ax.scatter(m, d, s=6, alpha=0.4)
-        ax.axhline(d.mean(), color="k")
-        ax.axhline(d.mean() + 1.96 * d.std(), ls="--", color="grey")
-        ax.axhline(d.mean() - 1.96 * d.std(), ls="--", color="grey")
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel("mean of estimate and reference (events/h)")
-        ax.set_ylabel("estimate - reference (events/h)")
-    fig.suptitle("Full model (273 features): per-subject Bland-Altman, 1,159 test subjects", fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out_dir / "t1_bland_altman_full.png", dpi=150)
-    plt.close(fig)
+    plot_t1(per, out_dir)
     return out
 
 
@@ -555,7 +567,8 @@ def run_anatomy(preds: dict, ctx: pd.DataFrame, subj: pd.DataFrame, out_dir: Pat
 # ============================================================================ CLI
 
 @click.command()
-@click.option("--tasks", default="events,calibration,anatomy", show_default=True)
+@click.option("--tasks", default="events,calibration,anatomy", show_default=True,
+              help="Comma-separated: events, calibration, anatomy, t1fig (redraw T1 figures from saved indices).")
 @click.option("--n-boot", type=int, default=1000, show_default=True)
 @click.option("--out-root", type=click.Path(path_type=Path), default=OUT_ROOT, show_default=True)
 @click.option("--rebuild-context", is_flag=True, help="Re-read parquets and XMLs even if the cache exists.")
@@ -576,6 +589,10 @@ def main(tasks, n_boot, out_root, rebuild_context, subjects_file) -> None:
     ctx = subj = None
     if tasks & {"events", "anatomy"}:
         ctx, subj = build_context(preds[next(iter(preds))], out_root, rebuild_context)
+    if "t1fig" in tasks:
+        per = pd.read_parquet(out_root / "t1_per_subject_indices.parquet")
+        for r in ("full", "physio_only"):
+            plot_t1(per, out_root, r)
     if "events" in tasks:
         summary["t1_events"] = run_events(preds, subj, out_root, n_boot)["reference_gap"]["median"]
     if "calibration" in tasks:
