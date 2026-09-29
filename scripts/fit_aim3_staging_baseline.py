@@ -51,11 +51,14 @@ Usage:
 from __future__ import annotations
 
 import datetime
+import io
 import json
 import os
 import platform
 import subprocess
+import re
 import sys
+import tarfile
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -135,12 +138,58 @@ def select_features(all_cols: list[str], config: str) -> list[str]:
     return cols
 
 
+# --------------------------------------------------------------------------- feature source
+
+class TarSource:
+    """Random access to per-subject parquets inside an UNCOMPRESSED tar of the features dir.
+
+    Each read opens its own file handle at the member's byte offset, so it is
+    thread-safe. Used when iCloud has evicted the local parquets; the tar is
+    the same features_version snapshot the Colab runs extract.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.members: dict[int, tuple[int, int]] = {}
+        with tarfile.open(self.path) as tf:
+            for m in tf:
+                hit = re.fullmatch(r"(?:.*/)?shhs1-(\d+)\.parquet", m.name)
+                if m.isfile() and hit:
+                    self.members[int(hit.group(1))] = (m.offset_data, m.size)
+
+    def data(self, sid: int) -> bytes:
+        off, size = self.members[sid]
+        with open(self.path, "rb") as fh:
+            fh.seek(off)
+            return fh.read(size)
+
+
+_TAR: TarSource | None = None  # set in main() when --features-tar is given
+
+
+def _read(key, columns: list[str]):
+    """Read columns for one subject; key is a parquet Path (dir mode) or a subject id (tar mode)."""
+    if _TAR is None:
+        return pq.read_table(key, columns=columns)
+    return pq.read_table(io.BytesIO(_TAR.data(int(key))), columns=columns)
+
+
+def _schema_names(key) -> list[str]:
+    if _TAR is None:
+        return pq.read_schema(key).names
+    return pq.ParquetFile(io.BytesIO(_TAR.data(int(key)))).schema_arrow.names
+
+
+def _key_id(key) -> int:
+    return int(key) if _TAR is not None else int(Path(key).stem.split("-")[1])
+
+
 # --------------------------------------------------------------------------- cohort index
 
 def build_index(files: list[Path], version: str) -> list[dict]:
     """Pass 1: per subject, which rows to keep and their stage labels."""
     def one(f: Path) -> dict | None:
-        t = pq.read_table(f, columns=["subject_id", "sleep_stage", "features_version"]).to_pandas()
+        t = _read(f, ["subject_id", "sleep_stage", "features_version"]).to_pandas()
         if t.empty or t["features_version"].iloc[0] != version:
             return None
         st = t["sleep_stage"].astype(str).values
@@ -194,7 +243,7 @@ def load_matrix(index_by_subject: dict, ordered_subjects: list[int], cols: list[
     def fill(k: int) -> None:
         r = index_by_subject[ordered_subjects[k]]
         a, b = offsets[k], offsets[k + 1]
-        df = pq.read_table(r["file"], columns=cols + ["epoch_idx"]).to_pandas()
+        df = _read(r["file"], cols + ["epoch_idx"]).to_pandas()
         X[a:b] = df[cols].to_numpy(dtype=np.float32)[r[rows_key]]
         eidx[a:b] = df["epoch_idx"].to_numpy()[r[rows_key]]
         y[a:b] = r[y_key]
@@ -381,22 +430,32 @@ def run_environment() -> dict:
               show_default=True,
               help="Any Aim 2 test_predictions.parquet; its subject set must equal this run's test "
                    "subjects. On Colab, point at the Drive copy under results/.")
-def main(features_version, seed, configs, max_subjects, out_root, aim2_reference) -> None:
+@click.option("--features-tar", type=click.Path(exists=True, path_type=Path), default=None,
+              help="Read per-subject parquets from an uncompressed tar of the features dir instead of "
+                   "features/ (e.g. Code/features-phase1batch-v1.tar when iCloud has evicted files).")
+def main(features_version, seed, configs, max_subjects, out_root, aim2_reference, features_tar) -> None:
+    global _TAR
     configs = [c.strip() for c in configs.split(",") if c.strip()]
     for c in configs:
         if c not in CONFIGS:
             raise click.BadParameter(f"unknown config {c!r}")
     out_root.mkdir(parents=True, exist_ok=True)
 
-    files = [f for f in sorted(FEATURES_DIR.glob("*.parquet"))
-             if f.name != "subject_metadata.parquet" and not f.name.startswith("._")]
+    if features_tar is not None:
+        _TAR = TarSource(features_tar)
+        files = sorted(_TAR.members)
+        source = f"tar {features_tar.name}"
+    else:
+        files = [f for f in sorted(FEATURES_DIR.glob("*.parquet"))
+                 if f.name != "subject_metadata.parquet" and not f.name.startswith("._")]
+        source = str(FEATURES_DIR)
     canon_te: set[int] = set()
     if max_subjects:
         # Smoke subjects come only from the canonical train/val pool, never the held-out test set.
-        all_ids = np.array([int(f.stem.split("-")[1]) for f in files])
+        all_ids = np.array([_key_id(f) for f in files])
         canon_te = {int(x) for x in split_subjects(all_ids, seed)[2]}
-        files = [f for f in files if int(f.stem.split("-")[1]) not in canon_te][:max_subjects]
-    print(f"=== Aim 3 staging baseline ===\n  {len(files)} parquet files, version {features_version}")
+        files = [f for f in files if _key_id(f) not in canon_te][:max_subjects]
+    print(f"=== Aim 3 staging baseline ===\n  {len(files)} subjects from {source}, version {features_version}")
 
     t0 = time.time()
     index = build_index(files, features_version)
@@ -415,7 +474,7 @@ def main(features_version, seed, configs, max_subjects, out_root, aim2_reference
         assert not (smoke & canon_te), "smoke subset contains canonical held-out test subjects"
         print(f"  SMOKE MODE: {len(smoke)} subjects, all from the canonical train/val pool (not for reporting)")
 
-    all_cols = pq.read_schema(index[0]["file"]).names
+    all_cols = _schema_names(index[0]["file"])
     env = run_environment()
     print("  env: " + json.dumps(env))
     summary = {"features_version": features_version, "seed": seed, "env": env, "configs": {}}
