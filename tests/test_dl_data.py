@@ -34,7 +34,7 @@ from thesis_pipeline.dl_eval import (  # noqa: E402
     assemble_predictions,
     check_schema,
     claim_rule,
-    gap_contrast,
+    gap_per_seed,
     metadata_with_ahi,
     paired_delta,
     seed_averaged_delta,
@@ -334,26 +334,32 @@ def test_paired_delta_equals_subject_paired_bootstrap():
 
 
 def test_claim_rule_seed_average_and_gap():
+    """Pre-registered verdicts (A-E, none) on paired_delta records; full cases in test_dl_eval_rules.py."""
     base = np.linspace(0.80, 0.82, 100)
     hi = [base + 0.03 + 0.001 * k for k in range(3)]
     per_seed = [paired_delta(h, base, float(h.mean()), float(base.mean())) for h in hi]
-    assert claim_rule(per_seed)["verdict"] == "DL > reference"
+    sa = seed_averaged_delta(hi, base, [float(h.mean()) for h in hi], float(base.mean()))
+    cr = claim_rule(per_seed, sa)
+    assert cr["verdict"] == "A" and cr["direction"] == "DL > reference" and cr["abs_mean_gt_seed_sd"]
     small = [paired_delta(base + 0.005, base, 0.815, 0.81)] * 3
-    assert claim_rule(small)["verdict"] == "no difference claimed"  # |delta| < 0.01
-    # all CIs above 0 and |mean| >= 0.01, but the mean lies within one seed SD -> no claim
+    assert claim_rule(small)["verdict"] == "B"  # every CI above 0 but |delta| < 0.01
+    # all CIs above 0 and |mean| >= 0.01, but the mean lies within one seed SD -> B, not A
     spread = [paired_delta(base + d, base, float(base.mean()) + d, float(base.mean())) for d in (0.001, 0.002, 0.040)]
     cr = claim_rule(spread)
-    assert cr["all_ci_above_0"] and cr["abs_mean_ge_min_effect"] and cr["abs_mean_within_seed_sd"]
+    assert cr["all_ci_above_0"] and cr["abs_mean_ge_min_effect"] and not cr["abs_mean_gt_seed_sd"]
     assert cr["mean_delta"] == pytest.approx(0.014333, abs=1e-6) and cr["sd_delta"] == pytest.approx(0.022234, abs=1e-6)
-    assert cr["verdict"] == "no difference claimed"
+    assert cr["verdict"] == "B" and cr["direction"] is None
     neg = [paired_delta(base - d, base, float(base.mean()) - d, float(base.mean())) for d in (0.001, 0.002, 0.040)]
-    assert claim_rule(neg)["verdict"] == "no difference claimed"
-    assert not claim_rule(per_seed)["abs_mean_within_seed_sd"]
-    assert claim_rule(per_seed[:2])["verdict"].startswith("insufficient")
-    sa = seed_averaged_delta(hi, base, [float(h.mean()) for h in hi], float(base.mean()))
+    assert claim_rule(neg)["verdict"] == "B" and claim_rule(neg)["all_ci_below_0"]
+    assert claim_rule(per_seed[:2])["verdict"] is None
     assert sa["delta_boot_mean"] == pytest.approx(0.031) and sa["p_text"] == "p < 0.001"
-    g = gap_contrast(hi, [base] * 3, base + 0.01, base)
-    assert g["delta_boot_mean"] == pytest.approx(0.021)
+    assert sa["delta_point"] == pytest.approx(np.mean([r["delta_point"] for r in per_seed]), abs=1e-12)
+    runs =lambda arrs: {s: {"auc": float(a.mean()), "boot_auc": a} for s, a in zip((42, 43, 44), arrs)}  # noqa: E731
+    g = gap_per_seed(runs(hi), runs([base] * 3), {"auc": float((base + 0.01).mean()), "boot_auc": base + 0.01},
+                     {"auc": float(base.mean()), "boot_auc": base})
+    assert g["seed_averaged"]["delta_boot_mean"] == pytest.approx(0.021)
+    assert g["seed_averaged"]["delta_point"] == pytest.approx(0.021)
+    assert g["claim_rule_auc"]["verdict"] == "A"
 
 
 def test_metadata_with_ahi_handles_string_ids():

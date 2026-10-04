@@ -14,12 +14,25 @@ Examples
     # (checkpoints and outputs are written locally and mirrored to Drive; a Drive I/O
     #  error is retried on the next save instead of stopping the run)
 
-    # Mac smoke test: 50 batches on MPS, loss must fall
+    # pilot before the freeze (never reportable)
+    python scripts/train_aim2_dl.py --config M --model-seed 42 --allow-unfrozen --max-passes 2 ...
+
+    # Mac smoke test: 50 batches on MPS, loss must fall (no checkpoints; no freeze needed)
     python scripts/train_aim2_dl.py --config M --model-seed 42 --smoke-batches 50 --device mps \
         --train-dir ~/thesis_dl_cache/model_v1/train --out-dir /tmp/smoke
 
 Seeds: 42, 43, 44 (``--model-seed``); the split seed stays 42 and is never changed here.
-F6 is deferred (Aim 1 airflow picker defect) and needs ``--allow-deferred``.
+F6 is outside the pre-registration (Aim 1 airflow picker defect) and needs ``--allow-deferred``.
+
+Pre-registration freeze: training refuses to start (or resume) unless the frozen
+pre-registration record ``prereg/aim2_dl_olsen_v1_freeze.json`` is in the checked-out code.
+The freeze summary at the start of the run is stored in every checkpoint
+(``state["prereg_freeze_first"]``, never overwritten on resume) and in metrics.json, with
+the current one (``prereg_freeze``) and the cache data versions. ``--allow-unfrozen`` is for
+PILOT runs only: their outputs are never reportable, and ``predict_aim2_dl.py`` refuses a
+checkpoint that did not start under the freeze, or was ever run with the flag, for test.
+For the same reason a production invocation refuses to resume such a checkpoint (a pilot's
+--ckpt-dir / --mirror-dir): give the production run fresh folders.
 """
 from __future__ import annotations
 
@@ -34,6 +47,7 @@ sys.path.insert(0, str(CODE_ROOT))
 
 from thesis_pipeline.dl_aggregate import AGGREGATORS  # noqa: E402
 from thesis_pipeline.dl_train import CONFIGS, RECIPES, Trainer, TrainSettings  # noqa: E402
+from thesis_pipeline.prereg import PreregMismatch  # noqa: E402
 
 DEFAULT_SPLIT = CODE_ROOT / "splits" / "aim2_seed42.json"
 
@@ -63,17 +77,20 @@ DEFAULT_SPLIT = CODE_ROOT / "splits" / "aim2_seed42.json"
 @click.option("--prefetch", type=int, default=2, show_default=True)
 @click.option("--num-threads", type=int, default=None)
 @click.option("--allow-deferred", is_flag=True, help="allow F6 (deferred by decision 2026-09-30)")
+@click.option("--allow-unfrozen", is_flag=True,
+              help="PILOT ONLY: train without the frozen pre-registration record; outputs are never "
+                   "reportable and predict_aim2_dl.py refuses them for test")
 @click.option("--smoke-batches", type=int, default=None, help="only run N training batches and report loss")
 def main(config, model_seed, recipe, train_dir, val_dir, split_json, ckpt_dir, mirror_dir, out_dir, device,
          amp, aggregator, ckpt_every_steps, stop_after_passes, max_passes, max_batches_per_pass, eval_batch,
-         prefetch, num_threads, allow_deferred, smoke_batches) -> None:
+         prefetch, num_threads, allow_deferred, allow_unfrozen, smoke_batches) -> None:
     """Train, validate each pass, checkpoint, then write val predictions + postproc + metrics."""
     s = TrainSettings(
         config=config, model_seed=model_seed, recipe=recipe, amp=amp, device=device,
         eval_batch=eval_batch, prefetch=prefetch, ckpt_every_steps=ckpt_every_steps,
         stop_after_passes=stop_after_passes, max_passes=max_passes,
         max_batches_per_pass=max_batches_per_pass, aggregator=aggregator,
-        allow_deferred=allow_deferred, num_threads=num_threads,
+        allow_deferred=allow_deferred, num_threads=num_threads, allow_unfrozen=allow_unfrozen,
     )
     out = Path(out_dir)
     if smoke_batches:
@@ -89,7 +106,10 @@ def main(config, model_seed, recipe, train_dir, val_dir, split_json, ckpt_dir, m
     click.echo(f"config {config} channels {tr.channels} seed {model_seed} recipe {recipe} "
                f"device {tr.device} amp {tr.amp} params {tr.n_params:,} hash {tr.config_hash}")
     click.echo(f"train {tr.train.n_subjects} subjects, val {tr.val.n_subjects} subjects")
-    status = tr.run()
+    try:
+        status = tr.run()
+    except PreregMismatch as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"status: {status}")
 
 

@@ -49,7 +49,18 @@ Test protection
   full mode      physio_only_repro may be scored on test (it re-derives an
                  already-reported number with an unchanged model). ecg_only /
                  ecg_belt refuse to score test without --prereg <vault note>
-                 (sha256 logged) AND a saved --train-only run in <cell>/val/.
+                 whose body (bytes above '## Addenda') matches the committed
+                 freeze record (thesis_pipeline.prereg.check_prereg; the whole
+                 record goes into metrics.json["prereg"]) AND a saved
+                 --train-only run in <cell>/val/ AND finished DL test inference
+                 of the matched config (ordering guard: ecg_only needs
+                 <dl-runs-root>/M/seed{42,43,44}/predict_test.json, ecg_belt the
+                 same for P4, each with split 'test'; LightGBM cells are scored
+                 on test only after DL test inference of the matched config).
+                 Before anything is read, the saved run must be the pinned
+                 model (sha256 of val/model.txt == metrics_trainonly.json
+                 model_sha256 == dl_eval.PINNED_REF_MODEL_SHA256[cell]); and
+                 --train-only refuses to overwrite a pinned val/model.txt.
                  Before any test row is loaded, the refit must reproduce that
                  run: validation predictions within 1e-6 and a byte-identical
                  model file (sha256 of <cell>/test/model_full.txt ==
@@ -77,7 +88,7 @@ Usage:
   python scripts/fit_aim2_matched_cells.py --cell physio_only_repro
   python scripts/fit_aim2_matched_cells.py --cell ecg_only --train-only
   python scripts/fit_aim2_matched_cells.py --cell ecg_belt --train-only
-  python scripts/fit_aim2_matched_cells.py --cell ecg_only --prereg '<vault note>'   # once, after the freeze
+  python scripts/fit_aim2_matched_cells.py --cell ecg_only --prereg '<vault note>'   # once, after M test inference
   python scripts/fit_aim2_matched_cells.py --cell ecg_only --train-only --smoke 200 \\
       --out-root /private/tmp/claude-501/dl_build/trackC/smoke
 """
@@ -123,14 +134,19 @@ from fit_aim2_v85_taxonomy_ablation import (  # noqa: E402
     subject_bootstrap,
 )
 from fit_aim3_staging_baseline import TarSource, run_environment  # noqa: E402
+from thesis_pipeline.dl_eval import PINNED_REF_MODEL_SHA256, PRIMARY_CONTRASTS, REQUIRED_SEEDS  # noqa: E402
 from thesis_pipeline.epochs import sleep_mask  # noqa: E402
 from thesis_pipeline.extended_metrics import write_extended_metrics  # noqa: E402
 from thesis_pipeline.matched_cells import CELLS, caveats_for, cell_columns  # noqa: E402
+from thesis_pipeline.prereg import PreregMismatch, check_prereg  # noqa: E402
 from thesis_pipeline.splits import load_split  # noqa: E402
 
 DEFAULT_TAR = CODE_ROOT / "features-phase1batch-v1.tar"
 DEFAULT_SPLIT = CODE_ROOT / "splits" / "aim2_seed42.json"
 OUT_ROOT = CODE_ROOT / "models" / "aim2_matched_cells_v1"
+DL_RUNS_ROOT = CODE_ROOT / "models" / "aim2_dl_olsen_v1"
+# matched cell -> the DL config whose test inference must finish before the cell is scored on test
+DL_CONFIG_FOR_CELL = {cell: cfg for cfg, cell in PRIMARY_CONTRASTS.items()}
 CANONICAL_DIR = CODE_ROOT / "models" / "recovery_2026-05-03" / "aim2_v85_taxonomy" / "physio_only"
 METADATA_MEMBER = "features/subject_metadata.parquet"
 THRESHOLDS = np.linspace(0.05, 0.95, 91)  # fit_aim2_v85_taxonomy_ablation.py:273
@@ -323,6 +339,43 @@ def archive_test_outputs(test_dir: Path, reason: str) -> Path:
     return dest
 
 
+def missing_dl_test_runs(dl_runs_root: Path, cell: str) -> list[str]:
+    """Runs of the matched DL config without a finished test inference (examiner-7 ordering guard).
+
+    Each of <dl_runs_root>/<config>/seed{42,43,44}/predict_test.json must exist and record
+    split 'test' (and, when present, the folder's config and model seed).
+    """
+    cfg = DL_CONFIG_FOR_CELL[cell]
+    missing = []
+    for seed in REQUIRED_SEEDS:
+        pj = dl_runs_root / cfg / f"seed{seed}" / "predict_test.json"
+        try:
+            prov = json.loads(pj.read_text())
+        except (OSError, ValueError):
+            missing.append(f"{cfg}/seed{seed} (no readable predict_test.json)")
+            continue
+        ok = (prov.get("split") == "test" and prov.get("config", cfg) == cfg
+              and str(prov.get("model_seed", seed)) == str(seed))
+        if not ok:
+            missing.append(f"{cfg}/seed{seed} (predict_test.json is not a test inference of {cfg} seed {seed})")
+    return missing
+
+
+def check_pinned_trainonly(val_dir: Path, cell: str) -> dict:
+    """The saved --train-only model must be the one the pre-registration pins (PINNED_REF_MODEL_SHA256):
+    sha256(val/model.txt) == metrics_trainonly.json model_sha256 == the pinned value. Checked before
+    anything is read, so the refit (which must reproduce val/model.txt byte-for-byte) reproduces the pin."""
+    want = PINNED_REF_MODEL_SHA256.get(cell)
+    file_sha = sha256_file(val_dir / "model.txt")
+    recorded = json.loads((val_dir / "metrics_trainonly.json").read_text()).get("model_sha256")
+    if not (want and file_sha == recorded == want):
+        raise click.ClickException(
+            f"{val_dir}: model.txt sha256 {file_sha[:12]} / metrics_trainonly.json model_sha256 {str(recorded)[:12]} "
+            f"is not the pinned {cell} train-only model {str(want)[:12]} (pre-registration); not scoring test")
+    return {"pinned_model_sha256": want, "trainonly_model_sha256_file": file_sha,
+            "trainonly_model_sha256_recorded": recorded, "passed": True}
+
+
 def check_against_trainonly(val_dir: Path, va_df: pd.DataFrame, refit_model: Path) -> dict:
     """Compare a refit with the saved --train-only run in ``val_dir`` (predictions and model bytes)."""
     saved = json.loads((val_dir / "metrics_trainonly.json").read_text())
@@ -421,6 +474,10 @@ def _assert_boot_equal(out_dir: Path, aucs: np.ndarray, auprs: np.ndarray) -> No
 @click.option("--out-root", type=click.Path(path_type=Path), default=OUT_ROOT, show_default=True)
 @click.option("--prereg", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
               help="Pre-registration note. Required to score ecg_only / ecg_belt on test.")
+@click.option("--dl-runs-root", type=click.Path(file_okay=False, path_type=Path), default=DL_RUNS_ROOT,
+              show_default=True,
+              help="DL run folders; scoring ecg_only / ecg_belt on test needs <root>/<M|P4>/seed{42,43,44}/"
+                   "predict_test.json (DL test inference of the matched config comes first).")
 @click.option("--rerun-reason", default=None,
               help="Required to score test again when <cell>/test/ already holds outputs; the old "
                    "outputs are moved to <cell>/test/superseded_<UTC>/.")
@@ -428,7 +485,7 @@ def _assert_boot_equal(out_dir: Path, aucs: np.ndarray, auprs: np.ndarray) -> No
               help="Pipeline smoke test on the first N inner-train subjects (and N//5 val "
                    "subjects); forces --train-only; needs --out-root. Not for reporting.")
 def main(cell, train_only, features_tar, features_version, split_file, seed, canonical_dir, out_root,
-         prereg, rerun_reason, smoke):
+         prereg, dl_runs_root, rerun_reason, smoke):
     t_start = time.time()
     if seed != 42:
         raise click.BadParameter("--seed must be 42 (canonical Aim 2 test subjects)")
@@ -442,17 +499,34 @@ def main(cell, train_only, features_tar, features_version, split_file, seed, can
 
     # ---- full-mode preflight: nothing is read until these pass
     prev_outputs: list[Path] = []
+    prereg_info = None
+    pinned_check = None
     if not train_only:
         if cell != REPRO_CELL and prereg is None:
             raise click.UsageError(
                 f"Scoring {cell} on the held-out test set requires --prereg <vault note>. "
                 "Use --train-only for inner-validation metrics.")
+        if cell != REPRO_CELL:
+            try:
+                prereg_info = check_prereg(prereg)  # body vs the committed freeze record
+            except PreregMismatch as e:
+                raise click.ClickException(str(e)) from e
+        elif prereg is not None:  # the reproduction cell needs no pre-registration; logged as before
+            prereg_info = {"path": str(prereg), "sha256": sha256_file(prereg)}
+        if cell != REPRO_CELL:
+            missing = missing_dl_test_runs(dl_runs_root, cell)
+            if missing:
+                raise click.ClickException(
+                    "LightGBM cells are scored on test only after DL test inference of the matched config; "
+                    f"refusing to score {cell}: missing {', '.join(missing)} under {dl_runs_root}")
         if cell != REPRO_CELL and not ((val_dir / "metrics_trainonly.json").exists()
                                        and (val_dir / "val_predictions.parquet").exists()
                                        and (val_dir / "model.txt").exists()):
             raise click.UsageError(
                 f"no saved --train-only run in {val_dir}; refusing to score {cell} on test. "
                 f"Run --cell {cell} --train-only with the same --out-root first.")
+        if cell != REPRO_CELL:
+            pinned_check = check_pinned_trainonly(val_dir, cell)
         prev_outputs = existing_test_outputs(test_dir)
         if prev_outputs and not rerun_reason:
             raise click.UsageError(
@@ -463,6 +537,10 @@ def main(cell, train_only, features_tar, features_version, split_file, seed, can
             raise click.UsageError(f"--rerun-reason given but {test_dir} holds no earlier test outputs")
     elif rerun_reason:
         raise click.UsageError("--rerun-reason only applies to full (test-scoring) mode")
+    elif (val_dir / "model.txt").exists() and sha256_file(val_dir / "model.txt") in PINNED_REF_MODEL_SHA256.values():
+        raise click.UsageError(
+            f"{val_dir / 'model.txt'} is a pinned train-only model (pre-registration); --train-only would overwrite "
+            "it. To check that it reproduces, use another --out-root (full mode checks the refit byte-for-byte).")
 
     physio_cols = json.loads((canonical_dir / "feature_list.json").read_text())
     cols = cell_columns(cell, physio_cols)
@@ -645,7 +723,6 @@ def main(cell, train_only, features_tar, features_version, split_file, seed, can
         return
 
     # ---- full mode: the refit must reproduce the saved train-only run BEFORE any test row is read
-    prereg_info = {"path": str(prereg), "sha256": sha256_file(prereg)} if prereg is not None else None
     cell_dir.mkdir(parents=True, exist_ok=True)
     partial = cell_dir / PARTIAL_MODEL
     model.booster_.save_model(str(partial))
@@ -725,6 +802,7 @@ def main(cell, train_only, features_tar, features_version, split_file, seed, can
         "test_recall_tuned": test_r,
         "fit_seconds": fit_time,
         "prereg": prereg_info,
+        "pinned_trainonly_check": pinned_check,
         "trainonly_guard": guard,
         "trainonly_val_pred_max_abs_diff": None if guard is None else guard["val_pred_max_abs_diff"],
         "rerun": rerun,

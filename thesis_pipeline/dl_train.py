@@ -1,13 +1,34 @@
-"""Trainer for the Aim 2 Olsen BiGRU (design section 5, decisions of 2026-09-30).
+"""Trainer for the Aim 2 Olsen BiGRU (the vault pre-registration note governs).
 
 Recipe A (default): AdamW lr 1e-3, weight_decay 1e-4, batch 128, unweighted per-second
 BCEWithLogits masked to sleep seconds inside the night, ReduceLROnPlateau(mode="max",
-factor 0.1, patience 3, abs threshold 1e-4) on validation epoch AUC with the ``mean``
-aggregator, early stop on the 6th consecutive pass without improvement, at most 25
-passes. torch cuts the LR when the count of non-improving passes EXCEEDS the patience,
-so recipe A cuts on the 4th consecutive non-improving pass and at most 2 passes run at
-the reduced LR before the stop (``schedule_facts``). Recipes B and C are the Colab-gate
-fallbacks (design section 5).
+factor 0.1, patience 3, abs threshold 1e-4, no LR floor) on validation epoch AUC with the
+``mean`` aggregator (the same AUC selects the checkpoint and drives early stopping), early
+stop on the 6th consecutive pass without improvement, at most 25 passes. torch cuts the LR
+when the count of non-improving passes EXCEEDS the patience, so recipe A cuts on the 4th
+consecutive non-improving pass. If no gain follows the cut, 2 passes run at the reduced LR
+before the stop; a gain > 1e-4 resets both counters, so training continues and further
+x0.1 cuts are possible (``schedule_facts``, ``SCHEDULE_NOTE``). Recipes B and C are the
+Colab-gate fallbacks (``scripts/bench_bigru.gate_recipe``).
+
+Pre-registration freeze: ``Trainer.run()`` refuses to train unless the frozen
+pre-registration record (``prereg.AIM2_DL_FREEZE``) exists, except for pilot runs with
+``TrainSettings.allow_unfrozen`` (never reportable; ``predict_aim2_dl.py`` refuses them for
+test). The freeze summary at the start of the run (pass 0, step 0) is kept in
+``state["prereg_freeze_first"]`` and never overwritten on resume; every checkpoint and
+metrics.json also carry the current summary (``prereg_freeze``), ``allow_unfrozen`` and the
+cache ``data_versions`` (front-end, stage-B and EDR versions of train and val). A production
+invocation (no ``allow_unfrozen``) refuses to resume a checkpoint that can never be reported
+(it did not start under the freeze, or a pilot invocation resumed it), before any pass is
+spent; that run needs fresh checkpoint folders.
+
+Code commits: every invocation of ``Trainer.run()`` (the first and every resume) appends its
+code commit (``git_commit()``, "-dirty" for modified code) to ``state["git_commits"]``, which
+is never cleared; checkpoints and metrics.json carry the list (and ``git_commit``, the commit
+of the invocation that saved them), so a run trained partly at another commit is visible
+(``predict_aim2_dl.py`` and ``evaluate_aim2_dl.py`` refuse it for test). A resumed invocation
+that adds a commit (or is the first with ``allow_unfrozen``) re-saves last.pt before any pass,
+so an invocation that only re-finalises a finished run is recorded in last.pt as well.
 
 Test protection: the trainer only opens packed folders whose MANIFEST split is
 "train" / "val", checks every subject against the frozen split JSON (no test id may
@@ -27,9 +48,15 @@ seed's folder) is refused before anything is copied. Window phases and order dep
 only on (model_seed, pass), so a resumed run replays exactly.
 
 Non-finite steps: without AMP (CPU, or the pre-declared ``--no-amp`` fallback) a step
-whose loss or gradients are non-finite is skipped (no optimiser update) and counted;
-with AMP the GradScaler already skips such steps. A checkpoint with non-finite weights
-is never written.
+whose loss or gradients are non-finite is skipped (no optimiser update) and counted
+(``nonfinite``); with AMP the GradScaler skips steps whose scaled gradients overflow (the
+loss may be finite) and those are counted separately (``scaler_skipped``: the step after
+which the GradScaler scale fell). Both counts go to history.csv and metrics.json. Every
+skipped step (either kind) is a non-finite training step: 20 consecutive ones (no applied
+step in between) raise FloatingPointError, the NaN fallback, with or without AMP; isolated
+ones trigger nothing (healthy fp16 training never skips 20 in a row: the scale would have to
+fall by 2^20, e.g. from the initial 2^16 to 2^-4). A checkpoint with non-finite weights is
+never written.
 
 Outputs in ``out_dir``: history.csv, val_predictions.parquet (best checkpoint, all
 aggregators), postproc.json (aggregator + threshold chosen on validation) and
@@ -67,9 +94,11 @@ from .dl_data import (
     sleep_epoch_key,
     train_window_starts,
 )
+from . import prereg
 from .dl_eval import THRESHOLDS, threshold_f1max
 from .dl_models import OlsenBiGRU, count_parameters
 from .dl_stage_b import CHANNELS, git_commit, sha256_file
+from .prereg import PreregMismatch
 
 CONFIGS: dict[str, tuple[str, ...]] = {
     "M": ("RR", "EDR"),
@@ -103,23 +132,32 @@ SCHEDULE_NOTE = (
     "20-epoch plateau. The wording is ambiguous. Reading (a): 10 'epochs' = 1 pass, so "
     "patience is about 1 pass (LR) and 2 passes (stop). Reading (b): 'epoch' = a full pass, "
     "so patience is 10 / 20 passes. This build: torch ReduceLROnPlateau(mode='max', factor 0.1, "
-    "patience P, abs threshold 1e-4) on validation epoch AUC (mean aggregator). torch cuts the LR "
-    "when the count of consecutive passes without a gain > 1e-4 EXCEEDS P, i.e. on the (P+1)-th "
-    "such pass (Keras, Olsen's framework, cuts on the P-th); early stopping fires on the S-th "
-    "consecutive such pass. Recipes A/B (P = 3, S = 6): LR cut on the 4th non-improving pass, stop "
-    "on the 6th, so at most 2 passes run at the reduced LR; recipe C (P = 2, S = 4): cut on the 3rd, "
-    "stop on the 4th, 1 reduced-LR pass. Caps 25 / 20 / 15 passes. More patient than reading (a), "
-    "less than (b)."
+    "patience P, abs threshold 1e-4, no min_lr) on validation epoch AUC (mean aggregator; the same "
+    "AUC selects the checkpoint and drives early stopping). torch cuts the LR when the count of "
+    "consecutive passes without a gain > 1e-4 EXCEEDS P, i.e. on the (P+1)-th such pass (Keras, "
+    "Olsen's framework, cuts on the P-th); early stopping fires on the S-th consecutive such pass. "
+    "Recipes A/B (P = 3, S = 6): LR cut on the 4th non-improving pass, stop on the 6th; recipe C "
+    "(P = 2, S = 4): cut on the 3rd, stop on the 4th. If no gain follows a cut, S-P-1 passes run at "
+    "the reduced LR before the stop (2 for A/B, 1 for C). A gain > 1e-4 resets both counters, so "
+    "training can continue at the reduced LR and further x0.1 cuts (no floor) are possible. "
+    "Caps 25 / 20 / 15 passes. More patient than reading (a), less than (b)."
 )
 
 
 def schedule_facts(r: Recipe) -> dict:
-    """When the LR cut and the early stop fire for recipe ``r`` (torch semantics)."""
+    """When the LR cut and the early stop fire for recipe ``r`` (torch semantics).
+
+    ``passes_at_reduced_lr_before_stop_if_no_gain`` holds only when no gain follows the cut;
+    a gain resets both counters and further cuts are possible (``further_cuts_possible``).
+    """
     return {
         "torch_lr_patience": r.lr_patience,
         "lr_cut_on_consecutive_nonimproving_pass": r.lr_patience + 1,
         "stop_on_consecutive_nonimproving_pass": r.stop_patience,
-        "max_passes_at_reduced_lr_before_stop": max(r.stop_patience - r.lr_patience - 1, 0),
+        "passes_at_reduced_lr_before_stop_if_no_gain": max(r.stop_patience - r.lr_patience - 1, 0),
+        "gain_resets_both_counters": True,
+        "further_cuts_possible": True,
+        "min_lr": 0.0,
         "max_passes": r.max_passes,
         "min_delta_abs": 1e-4,
     }
@@ -146,9 +184,14 @@ class TrainSettings:
     allow_deferred: bool = False
     num_threads: int | None = None
     split_seed: int = 42
+    allow_unfrozen: bool = False  # PILOT ONLY: train without the freeze record (never reportable)
 
     def run_fields(self) -> dict:
-        """Fields that change the trained weights (hashed; resume requires equality)."""
+        """Fields that change the trained weights (hashed; resume requires equality).
+
+        ``allow_unfrozen`` is deliberately absent: it does not change the weights, and the
+        checkpoint records whether the run STARTED under the freeze (prereg_freeze_first).
+        """
         keys = ("config", "model_seed", "recipe", "amp", "lr", "weight_decay", "min_delta",
                 "hidden", "max_passes", "max_batches_per_pass", "split_seed")
         return {k: getattr(self, k) for k in keys}
@@ -196,12 +239,14 @@ def predict_seconds(
 
 def score_split(
     model: OlsenBiGRU, ps: PackedSplit, device: torch.device, amp: bool, batch: int = 512,
-    prefetch: int = 2,
-) -> pd.DataFrame:
+    prefetch: int = 2, return_seconds: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, np.ndarray]:
     """Sleep-epoch scores for every aggregator on the fixed evaluation grid.
 
     Returns subject_id, epoch_idx, apnoea_label, stage, p_mean, p_max, p_k10, p_c10,
     sorted by (subject_id, epoch_idx); asserts every sleep epoch is scored exactly once.
+    With ``return_seconds`` returns ``(df, sec30)``: the per-second probabilities, float32
+    (n_sleep_epochs, 30), row-aligned with ``df``.
     """
     win = eval_windows(ps)
     sec = predict_seconds(model, ps, win, device, amp, batch, prefetch)
@@ -218,6 +263,11 @@ def score_split(
         and np.array_equal(df["epoch_idx"].to_numpy(np.int64), key["epoch_idx"].to_numpy(np.int64))
     ):
         raise AssertionError("evaluation grid did not score every sleep epoch exactly once")
+    if return_seconds:
+        sec30 = np.ascontiguousarray(sec30, dtype=np.float32)
+        if sec30.shape != (len(df), 30):
+            raise AssertionError(f"per-second array {sec30.shape} is not row-aligned with {len(df)} epochs")
+        return df, sec30
     return df
 
 
@@ -244,6 +294,18 @@ def _copy_atomic(src: Path, dst: Path) -> None:
 def _all_finite(tensors) -> bool:
     ts = [t for t in tensors if t is not None and torch.is_floating_point(t)]
     return bool(torch.stack([torch.isfinite(t).all() for t in ts]).all()) if ts else True
+
+
+DATA_VERSION_KEYS = ("frontend_version", "stage_b_version", "edr_method")
+
+
+def _data_versions(ps: PackedSplit) -> dict:
+    """Front-end / stage-B / EDR versions from a packed split's MANIFEST."""
+    return {k: ps.manifest.get(k) for k in DATA_VERSION_KEYS}
+
+
+UNFROZEN_MSG = ("production training needs the frozen pre-registration record "
+                "prereg/aim2_dl_olsen_v1_freeze.json; pass --allow-unfrozen for pilot runs (never reportable)")
 
 
 class Trainer:
@@ -325,12 +387,16 @@ class Trainer:
         }
         payload = json.dumps({"run": s.run_fields(), "data": data_sig}, sort_keys=True)
         self.config_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        self.data_versions = {"train": _data_versions(self.train),
+                              "val": _data_versions(self.val) if self.val else None}
+        self.prereg_freeze: dict | None = None  # current freeze summary; set by run()
         self.state = {
             "pass_idx": 0, "step_in_pass": 0, "best_auc": -np.inf, "best_pass": -1,
             "bad_passes": 0, "history": [], "done": False, "stop_reason": "",
-            "loss_sum": 0.0, "n_loss": 0, "nonfinite": 0, "consec_nonfinite": 0,
-            "pass_t_train": 0.0, "pass_windows": 0,
+            "loss_sum": 0.0, "n_loss": 0, "nonfinite": 0, "consec_nonfinite": 0, "scaler_skipped": 0,
+            "pass_t_train": 0.0, "pass_windows": 0, "git_commits": [],
         }
+        self.last_step_scaler_skipped = False  # set by _step under AMP
         self.best_model: dict | None = None  # CPU copy of the best weights; saved inside last.pt
         self._mirror_pending: dict[str, Path] = {}
         self.mirror_retry_wait_s = 10.0
@@ -368,8 +434,27 @@ class Trainer:
             "channels": list(self.channels),
             "n_params": self.n_params,
             "git_commit": self.git,
+            "git_commits": list(self.state.get("git_commits") or []),
+            "prereg_freeze": self.prereg_freeze,
+            "allow_unfrozen": self._unfrozen(),
+            "data_versions": self.data_versions,
             "saved": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+
+    # -- pre-registration freeze -----------------------------------------------
+    def _unfrozen(self) -> bool:
+        """True if this or any earlier invocation of the run passed ``allow_unfrozen``."""
+        return bool(self.s.allow_unfrozen or self.state.get("allow_unfrozen_ever"))
+
+    def _check_freeze(self) -> dict | None:
+        """Current freeze summary. Refuses without one unless ``allow_unfrozen`` (then None)."""
+        try:
+            return prereg.freeze_summary()
+        except PreregMismatch as exc:
+            if self.s.allow_unfrozen:
+                self.log(f"WARNING: PILOT run without the pre-registration freeze ({exc}); never reportable")
+                return None
+            raise PreregMismatch(f"{UNFROZEN_MSG} ({exc})") from exc
 
     def _save(self, name: str, payload: dict) -> None:
         if not _all_finite(payload["model"].values()):
@@ -448,6 +533,8 @@ class Trainer:
         self.sched.load_state_dict(ck["scheduler"])
         self.scaler.load_state_dict(ck["scaler"])
         self.state = ck["state"]
+        if not isinstance(self.state.get("git_commits"), list):  # a checkpoint from before the commit history
+            self.state["git_commits"] = [str(ck.get("git_commit") or "unknown")]
         self.best_model = ck.get("best_model")
         self._set_rng_state(ck["rng"])
         self.log(f"resumed from {path}: pass {self.state['pass_idx']}, step {self.state['step_in_pass']}, "
@@ -466,9 +553,12 @@ class Trainer:
         loss = (le * mf).sum() / mf.sum().clamp(min=1.0)
         self.opt.zero_grad(set_to_none=True)
         if self.amp:  # GradScaler skips the step itself when the scaled gradients are inf / NaN
+            scale_before = self.scaler.get_scale()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.opt)
             self.scaler.update()
+            # update() lowers the scale exactly when it found inf / NaN gradients, i.e. skipped the step
+            self.last_step_scaler_skipped = bool(self.scaler.get_scale() < scale_before)
             return float(loss.detach().item())
         loss_v = float(loss.detach().item())
         if not np.isfinite(loss_v):
@@ -480,20 +570,30 @@ class Trainer:
         self.opt.step()
         return loss_v
 
-    def _account(self, loss: float) -> None:
+    def _account(self, loss: float, scaler_skipped: bool = False) -> None:
+        """Count one training step. It is a non-finite training step when its loss is non-finite or
+        no update was applied because of non-finite gradients (without AMP ``_step`` then returns
+        NaN; with AMP the GradScaler skipped it). Only an applied step resets the consecutive count;
+        20 in a row raise the NaN fallback. The totals ``nonfinite`` and ``scaler_skipped`` stay separate."""
         st = self.state
-        if np.isfinite(loss):
+        if scaler_skipped:
+            st["scaler_skipped"] = int(st.get("scaler_skipped", 0)) + 1
+        finite = bool(np.isfinite(loss))
+        if finite:
             st["loss_sum"] += loss
             st["n_loss"] += 1
-            st["consec_nonfinite"] = 0
         else:
-            st["nonfinite"] += 1  # a skipped step (loss or gradients non-finite)
-            st["consec_nonfinite"] += 1
-            if st["consec_nonfinite"] >= 20:
-                raise FloatingPointError(
-                    "20 consecutive non-finite losses; per the pre-declared rule rerun ALL seeds of "
-                    "this config with --no-amp (same precision for every seed)"
-                )
+            st["nonfinite"] += 1  # a skipped step (loss or, without AMP, gradients non-finite)
+        if finite and not scaler_skipped:  # the optimiser step was applied
+            st["consec_nonfinite"] = 0
+            return
+        st["consec_nonfinite"] += 1
+        if st["consec_nonfinite"] >= 20:
+            raise FloatingPointError(
+                "20 consecutive non-finite training steps (non-finite loss, or non-finite gradients: the step was "
+                "skipped by the GradScaler or, without AMP, by the fp32 check); per the pre-declared rule rerun "
+                "ALL seeds of this config with --no-amp (same precision for every seed)"
+            )
 
     def train_pass(self) -> None:
         s, st = self.s, self.state
@@ -507,7 +607,9 @@ class Trainer:
                                        prefetch=s.prefetch, drop_singletons=True):
             if limit is not None and b >= limit:
                 break
-            self._account(self._step(bd))
+            self.last_step_scaler_skipped = False
+            loss = self._step(bd)
+            self._account(loss, scaler_skipped=self.last_step_scaler_skipped)
             st["step_in_pass"] = b + 1
             st["pass_windows"] += len(sel)
             if s.ckpt_every_steps and (b + 1) % s.ckpt_every_steps == 0:
@@ -547,6 +649,7 @@ class Trainer:
             "n_windows_pass": st.get("_n_windows_pass"),
             "n_windows_seen": st["pass_windows"],
             "nonfinite_total": st["nonfinite"],
+            "scaler_skipped_total": int(st.get("scaler_skipped", 0)),
             **{f"val_auc_{r}": v for r, v in aucs.items()},
             "improved": bool(improved),
             "best_auc": st["best_auc"],
@@ -575,7 +678,38 @@ class Trainer:
         """Train (resuming if possible) and finalise. Returns 'done' or 'paused'."""
         if self.val is None:
             raise RuntimeError("run() needs a validation split")
-        self.maybe_resume()
+        self.prereg_freeze = self._check_freeze()  # refuses before any checkpoint is read or written
+        resumed = self.maybe_resume()
+        st = self.state
+        if not resumed:  # a run starting from pass 0 / step 0 records the freeze it started under
+            st["prereg_freeze_first"] = self.prereg_freeze
+        else:  # never overwritten on resume; a checkpoint without the record counts as unfrozen
+            st.setdefault("prereg_freeze_first", None)
+            first, cur = st["prereg_freeze_first"], self.prereg_freeze
+            if not self.s.allow_unfrozen and (first is None or st.get("allow_unfrozen_ever")):
+                why = ("did not start under the frozen pre-registration (an --allow-unfrozen pilot or a run "
+                       "started before the freeze)" if first is None else "was resumed by an --allow-unfrozen run")
+                raise PreregMismatch(
+                    f"{self.ckpt_dir / 'last.pt'} {why}: this checkpoint can never be reported "
+                    "(predict_aim2_dl.py refuses it for test), so production training will not continue it. "
+                    "Use a fresh --ckpt-dir and --mirror-dir for the production run, or pass --allow-unfrozen "
+                    "to continue it as a pilot")
+            if first is not None and cur is not None and first.get("body_sha256") != cur.get("body_sha256"):
+                self.log(f"WARNING: this run started under frozen body {first.get('body_sha256', '')[:12]} but "
+                         f"the freeze record now says {cur.get('body_sha256', '')[:12]}")
+        new_record = False
+        if self.s.allow_unfrozen and not st.get("allow_unfrozen_ever"):
+            st["allow_unfrozen_ever"] = True
+            new_record = True
+        commits = st.setdefault("git_commits", [])
+        if self.git not in commits:  # every invocation's code commit; never cleared or overwritten
+            commits.append(self.git)
+            new_record = True
+        if resumed and new_record:
+            # Saved now, while the model still holds last.pt's weights: an invocation that runs no pass (a
+            # re-finalise) would otherwise record its commit / flag only in metrics.json, and a later
+            # re-finalise from last.pt would erase it. Same weights, optimiser, scheduler and RNG states.
+            self._save("last.pt", self._payload())
         n_this = 0
         while not self.state["done"]:
             self.train_pass()
@@ -685,6 +819,13 @@ class Trainer:
             "n_val_sleep_epochs": int(len(df)),
             "train_epoch_prevalence_sleep": float(self.train.epochs["apnoea_label"].to_numpy()[tr_mask].mean()),
             "nonfinite_losses": int(st["nonfinite"]),
+            "scaler_skipped_steps": int(st.get("scaler_skipped", 0)),
+            "skipped_steps_note": "nonfinite_losses: steps skipped because the loss (or, without AMP, a gradient) "
+                                  "was non-finite; scaler_skipped_steps: AMP steps the GradScaler skipped because "
+                                  "the scaled gradients overflowed (the loss may be finite; a non-finite loss "
+                                  "under AMP counts in both). Isolated skipped steps trigger nothing; the NaN "
+                                  "fallback is triggered by 20 consecutive non-finite training steps (steps of "
+                                  "either kind, with no applied step in between).",
             "device": str(self.device),
             "gpu_name": torch.cuda.get_device_name(0) if self.device.type == "cuda" else None,
             "amp": self.amp,
@@ -697,8 +838,14 @@ class Trainer:
             "split_sha256": self.split["sha256"],
             "train_manifest_split_sha256": self.train.manifest.get("split_sha256"),
             "frontend_version": self.train.manifest.get("frontend_version"),
+            "stage_b_version": self.train.manifest.get("stage_b_version"),
             "edr_method": self.train.manifest.get("edr_method"),
+            "data_versions": self.data_versions,
+            "prereg_freeze": self.prereg_freeze,
+            "prereg_freeze_first": st.get("prereg_freeze_first"),
+            "allow_unfrozen": self._unfrozen(),
             "git_commit": self.git,
+            "git_commits": list(st.get("git_commits") or []),
             "best_ckpt_sha256": best_sha,
             "best_ckpt_rewritten_from_last": rewritten,
             "best_auc_recheck_abs_diff": recheck,

@@ -1,0 +1,8 @@
+{
+  "note": "Thesis Vault/Experiments/2026-09-30 - Aim 2 DL Olsen BiGRU pre-registration.md",
+  "body_definition": "every byte before the first line that is exactly '## Addenda' (thesis_pipeline/prereg.note_body)",
+  "body_sha256": "dad0387b8fa40f99bd4463eb2996765d7bc9122f36a9ef5b6de1ae068045d67a",
+  "body_bytes": 36214,
+  "vault_commit": "07cde4010e8461571011bd2223fd4149238baaf7",
+  "frozen_utc": "2026-10-04T03:06:25Z"
+}

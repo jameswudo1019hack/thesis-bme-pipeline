@@ -5,12 +5,19 @@ values, hr_mean carrying the label) runs the real CLI end to end:
 
 * train-only mode writes one split per folder (<cell>/val/, with validation
   bootstrap arrays and metrics_extended.json) and never opens a test member;
-* full mode refuses to run without a saved train-only run, aborts before any test
-  row is read when the refit's model bytes or validation predictions differ from
-  it, and refuses a second test scoring unless --rerun-reason is given (the old
-  outputs are archived, not overwritten);
+* full mode refuses to run without a saved train-only run or (before anything is
+  read) when that run is not the pinned model (dl_eval.PINNED_REF_MODEL_SHA256,
+  patched to the synthetic model), aborts before any test row is read when the
+  refit's model bytes or validation predictions differ from it, and refuses a
+  second test scoring unless --rerun-reason is given (the old outputs are
+  archived, not overwritten); --train-only never overwrites a pinned model;
+* full mode refuses, before anything is read, a pre-registration whose body differs
+  from the (tmp, patched) freeze record, and any scoring before DL test inference of
+  the matched config (M for ecg_only, P4 for ecg_belt: seeds 42, 43, 44); the full
+  check_prereg record is written to metrics.json["prereg"];
 * every run record carries code_sha256 and the input-match caveats;
-* scripts/evaluate_aim2_dl.py load_ref can only pair a folder with its own split.
+* scripts/evaluate_aim2_dl.py load_ref can only pair a folder with its own split, and
+  accepts a primary comparator only with the pinned model sha256 and the frozen body.
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ from click.testing import CliRunner
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from thesis_pipeline import prereg as prereg_mod  # noqa: E402
 from thesis_pipeline.splits import split_record, write_split  # noqa: E402
 
 CANONICAL_LIST = (
@@ -40,6 +48,7 @@ SCRIPT = ROOT / "scripts" / "fit_aim2_matched_cells.py"
 EVALUATOR = ROOT / "scripts" / "evaluate_aim2_dl.py"
 N_SUBJ, N_EPOCHS, N_WAKE = 100, 60, 10
 VERSION = "2026-05-01-phase1batch-v1"
+PREREG_BODY = "# synthetic pre-registration\n\nLightGBM cells are scored after DL test inference.\n\n"
 
 
 def _load(path: Path, name: str):
@@ -112,12 +121,27 @@ class Env:
         pd.DataFrame({"subject_id": np.repeat(np.sort(te).astype(np.int32), 3)}).to_parquet(
             self.canon / "test_predictions.parquet", index=False)
         self.prereg = root / "prereg.md"
-        self.prereg.write_text("synthetic pre-registration\n")
+        self.prereg.write_text(PREREG_BODY + "## Addenda\n\n### 2026-10-05 synthetic addendum\n")
+        self.body = hashlib.sha256(PREREG_BODY.encode()).hexdigest()
+        self.freeze = root / "freeze.json"
+        self.freeze.write_text(json.dumps({"body_sha256": self.body, "vault_commit": "v" * 40}))
+        self.dl_root = root / "dl_runs"  # finished DL test inference of M and P4 (predict_test.json only)
+        for cfg in ("M", "P4"):
+            for seed in (42, 43, 44):
+                write_predict_test(self.dl_root, cfg, seed)
 
-    def invoke(self, out: Path, *extra: str):
+    def invoke(self, out: Path, *extra: str, dl_root: Path | None = None):
         args = ["--features-tar", str(self.tar), "--split-file", str(self.split_file),
-                "--canonical-dir", str(self.canon), "--out-root", str(out), *extra]
+                "--canonical-dir", str(self.canon), "--out-root", str(out),
+                "--dl-runs-root", str(dl_root or self.dl_root), *extra]
         return CliRunner().invoke(fam.main, args)
+
+
+def write_predict_test(root: Path, cfg: str, seed: int, **kw) -> Path:
+    d = root / cfg / f"seed{seed}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "predict_test.json").write_text(json.dumps({"split": "test", "config": cfg, "model_seed": seed, **kw}))
+    return d / "predict_test.json"
 
 
 @pytest.fixture(scope="module")
@@ -132,6 +156,19 @@ def base_ecg_only(env, tmp_path_factory) -> Path:
     r = env.invoke(out, "--cell", "ecg_only", "--train-only")
     assert r.exit_code == 0, r.output
     return out / "ecg_only" / "val"
+
+
+@pytest.fixture(autouse=True)
+def frozen(env, monkeypatch):
+    """The pre-registration freeze record of the synthetic note (prereg.AIM2_DL_FREEZE patched)."""
+    monkeypatch.setattr(prereg_mod, "AIM2_DL_FREEZE", env.freeze)
+
+
+@pytest.fixture(autouse=True)
+def pinned(base_ecg_only, monkeypatch):
+    """The synthetic ecg_only train-only model plays the pinned model (the real pins are in dl_eval)."""
+    monkeypatch.setattr(fam, "PINNED_REF_MODEL_SHA256", {**fam.PINNED_REF_MODEL_SHA256,
+                                                         "ecg_only": _sha(base_ecg_only / "model.txt")})
 
 
 @pytest.fixture
@@ -211,7 +248,7 @@ def test_full_mode_refuses_without_saved_trainonly_run(env, tmp_path, spies):
     assert not (tmp_path / "ecg_only").exists()
 
 
-def test_full_mode_scores_once_after_matching_trainonly_run(env, base_ecg_only, tmp_path, spies):
+def test_full_mode_scores_once_after_matching_trainonly_run(env, base_ecg_only, tmp_path, spies, monkeypatch):
     reads, loads = spies
     val = _with_saved_run(base_ecg_only, tmp_path)
     r = env.invoke(tmp_path, "--cell", "ecg_only", "--prereg", str(env.prereg))
@@ -229,7 +266,11 @@ def test_full_mode_scores_once_after_matching_trainonly_run(env, base_ecg_only, 
     assert m["trainonly_guard"]["passed"] is True
     assert m["trainonly_guard"]["val_pred_max_abs_diff"] <= fam.PROB_TOL
     assert m["model_sha256"] == _sha(test / "model_full.txt") == saved["model_sha256"]
-    assert m["prereg"]["sha256"] == _sha(env.prereg)
+    assert m["pinned_trainonly_check"]["passed"] is True
+    assert m["pinned_trainonly_check"]["pinned_model_sha256"] == fam.PINNED_REF_MODEL_SHA256["ecg_only"]
+    assert m["prereg"] == prereg_mod.check_prereg(env.prereg)
+    assert m["prereg"]["prereg_body_sha256"] == env.body
+    assert m["prereg"]["prereg_sha256"] == _sha(env.prereg)
     assert m["rerun"] is None
     assert m["code_sha256"]["thesis_pipeline/matched_cells.py"] == _sha(ROOT / "thesis_pipeline" / "matched_cells.py")
 
@@ -247,6 +288,15 @@ def test_full_mode_scores_once_after_matching_trainonly_run(env, base_ecg_only, 
         ev.load_ref(val, "test")
     with pytest.raises(Exception):
         ev.load_ref(test, "val")
+    # as a primary comparator: the synthetic model is not the pinned one ...
+    with pytest.raises(Exception, match="not the pinned model"):
+        ev.load_ref(test, "test", primary="ecg_only", freeze_body=env.body)
+    # ... and with its sha pinned, the prereg record written by this script is what evaluate checks
+    monkeypatch.setattr(ev, "PINNED_REF_MODEL_SHA256", {"ecg_only": m["model_sha256"]})
+    pinned = ev.load_ref(test, "test", primary="ecg_only", freeze_body=env.body)
+    assert pinned["prereg_body_sha256"] == env.body and pinned["model_sha256"] == m["model_sha256"]
+    with pytest.raises(Exception, match="frozen pre-registration"):
+        ev.load_ref(test, "test", primary="ecg_only", freeze_body="0" * 64)
 
 
 @pytest.mark.parametrize("tamper", ["model_sha256", "val_predictions"])
@@ -264,9 +314,33 @@ def test_full_mode_aborts_before_test_rows_when_refit_differs(env, base_ecg_only
     r = env.invoke(tmp_path, "--cell", "ecg_only", "--prereg", str(env.prereg))
     assert r.exit_code == 1
     assert "not scoring test" in r.output
-    assert loads and all(not s & env.test_ids for s in loads)  # no test row was read
+    if tamper == "model_sha256":  # the recorded sha no longer equals the pin: refused before anything is read
+        assert "is not the pinned ecg_only train-only model" in r.output and reads == [] and loads == []
+    else:  # refit vs the saved predictions: refused after the refit, before any test row
+        assert loads and all(not s & env.test_ids for s in loads)  # no test row was read
     assert not (tmp_path / "ecg_only" / "test").exists()
     assert not (tmp_path / "ecg_only" / fam.PARTIAL_MODEL).exists()
+
+
+def test_full_mode_refuses_a_saved_run_that_is_not_the_pinned_model(env, base_ecg_only, tmp_path, spies,
+                                                                     monkeypatch):
+    """The refit only has to reproduce val/model.txt; the preflight ties that file to the pinned sha."""
+    reads, loads = spies
+    _with_saved_run(base_ecg_only, tmp_path)
+    monkeypatch.setattr(fam, "PINNED_REF_MODEL_SHA256", {**fam.PINNED_REF_MODEL_SHA256, "ecg_only": "0" * 64})
+    r = env.invoke(tmp_path, "--cell", "ecg_only", "--prereg", str(env.prereg))
+    assert r.exit_code == 1 and "is not the pinned ecg_only train-only model" in r.output, r.output
+    assert reads == [] and loads == []
+    assert not (tmp_path / "ecg_only" / "test").exists()
+
+
+def test_train_only_never_overwrites_a_pinned_model(env, base_ecg_only, tmp_path, spies):
+    reads, loads = spies
+    val = _with_saved_run(base_ecg_only, tmp_path)
+    before = {p.name: _sha(p) for p in val.iterdir()}
+    r = env.invoke(tmp_path, "--cell", "ecg_only", "--train-only")
+    assert r.exit_code == 2 and "is a pinned train-only model" in r.output, r.output
+    assert reads == [] and loads == [] and {p.name: _sha(p) for p in val.iterdir()} == before
 
 
 def test_second_scoring_needs_rerun_reason_and_keeps_old_outputs(env, base_ecg_only, tmp_path, spies):
@@ -305,3 +379,65 @@ def test_rerun_reason_is_refused_without_earlier_outputs_or_in_train_only(env, b
     r = env.invoke(tmp_path, "--cell", "ecg_only", "--train-only", "--rerun-reason", "x")
     assert r.exit_code == 2
     assert reads == [] and loads == []
+
+
+# --------------------------------------------------------------------------- pre-registration and ordering guards
+
+
+def test_missing_dl_test_runs_names_every_unfinished_run(tmp_path):
+    root = tmp_path / "dl"
+    assert fam.missing_dl_test_runs(root, "ecg_only") == [
+        f"M/seed{s} (no readable predict_test.json)" for s in (42, 43, 44)]
+    for s in (42, 43, 44):
+        write_predict_test(root, "M", s)
+    assert fam.missing_dl_test_runs(root, "ecg_only") == []
+    assert len(fam.missing_dl_test_runs(root, "ecg_belt")) == 3  # P4 is matched to ecg_belt
+    write_predict_test(root, "M", 43, split="val")
+    write_predict_test(root, "M", 44, model_seed=42)
+    (root / "M" / "seed42" / "predict_test.json").write_text("{not json")
+    got = fam.missing_dl_test_runs(root, "ecg_only")
+    assert [g.split(" ")[0] for g in got] == ["M/seed42", "M/seed43", "M/seed44"]
+    assert "not a test inference of M seed 43" in got[1]
+
+
+@pytest.mark.parametrize("cell, cfg", [("ecg_only", "M"), ("ecg_belt", "P4")])
+def test_full_mode_refuses_before_dl_test_inference(env, base_ecg_only, tmp_path, spies, cell, cfg):
+    reads, loads = spies
+    _with_saved_run(base_ecg_only, tmp_path)
+    dl = tmp_path / "dl"
+    for seed in (42, 43):
+        write_predict_test(dl, cfg, seed)
+    write_predict_test(dl, cfg, 44, split="val")
+    r = env.invoke(tmp_path, "--cell", cell, "--prereg", str(env.prereg), dl_root=dl)
+    assert r.exit_code != 0
+    assert "scored on test only after DL test inference of the matched config" in r.output
+    assert f"{cfg}/seed44" in r.output and f"{cfg}/seed42" not in r.output
+    assert reads == [] and loads == []  # refused before anything was read
+    assert not (tmp_path / cell / "test").exists()
+
+
+def test_full_mode_refuses_unfrozen_or_edited_prereg(env, base_ecg_only, tmp_path, spies, monkeypatch):
+    reads, loads = spies
+    _with_saved_run(base_ecg_only, tmp_path)
+    no_addenda = tmp_path / "no_addenda.md"
+    no_addenda.write_text(PREREG_BODY)
+    edited = tmp_path / "edited.md"
+    edited.write_text(PREREG_BODY.replace("after", "before") + "## Addenda\n")
+    for note, msg in ((no_addenda, "no '## Addenda' line"), (edited, "may not change")):
+        r = env.invoke(tmp_path, "--cell", "ecg_only", "--prereg", str(note))
+        assert r.exit_code != 0 and msg in r.output, r.output
+    monkeypatch.setattr(prereg_mod, "AIM2_DL_FREEZE", tmp_path / "missing_freeze.json")
+    r = env.invoke(tmp_path, "--cell", "ecg_only", "--prereg", str(env.prereg))
+    assert r.exit_code != 0 and "has not been frozen" in r.output
+    assert reads == [] and loads == []
+    assert not (tmp_path / "ecg_only" / "test").exists()
+
+
+def test_appending_an_addendum_does_not_block_scoring(env, base_ecg_only, tmp_path):
+    _with_saved_run(base_ecg_only, tmp_path)
+    note = tmp_path / "note.md"
+    note.write_text(env.prereg.read_text() + "\n### 2026-11-01 later addendum\nM test inference done.\n")
+    r = env.invoke(tmp_path, "--cell", "ecg_only", "--prereg", str(note))
+    assert r.exit_code == 0, r.output
+    m = json.loads((tmp_path / "ecg_only" / "test" / "metrics.json").read_text())
+    assert m["prereg"]["prereg_body_sha256"] == env.body and m["prereg"]["prereg_sha256"] == _sha(note)

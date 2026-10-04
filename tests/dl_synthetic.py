@@ -160,18 +160,20 @@ SUBJECTS = {
 }
 
 
-def build_packed_dataset(root: Path, max_chunk_bytes: int = 1000 * 8, workers: int = 1) -> dict:
-    """Write synthetic stage A for SUBJECTS, a split JSON, and pack train / val / test."""
+def build_packed_dataset(root: Path, max_chunk_bytes: int = 1000 * 8, workers: int = 1,
+                         subjects: dict | None = None) -> dict:
+    """Write synthetic stage A for ``subjects`` (default SUBJECTS), a split JSON, and pack train / val / test."""
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from thesis_pipeline.dl_stage_b import pack_split
 
+    subjects = SUBJECTS if subjects is None else subjects
     root = Path(root)
     raw = root / "raw"
-    for sid, (_, n_ep, extra) in SUBJECTS.items():
+    for sid, (_, n_ep, extra) in subjects.items():
         write_stage_a(raw, sid, n_epochs=n_ep, seed=sid % 97, **extra)
-    split = {s: [i for i, v in SUBJECTS.items() if v[0] == s] for s in ("train", "val", "test")}
+    split = {s: [i for i, v in subjects.items() if v[0] == s] for s in ("train", "val", "test")}
     sj = write_split_json(root / "split.json", split["train"], split["val"], split["test"])
     out = root / "model"
     for s in ("train", "val", "test"):

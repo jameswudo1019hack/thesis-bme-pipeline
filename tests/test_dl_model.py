@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dl_synthetic import build_packed_dataset, write_split_json  # noqa: E402
-from thesis_pipeline import dl_train  # noqa: E402
+from thesis_pipeline import dl_train, prereg  # noqa: E402
 from thesis_pipeline.dl_aggregate import choose_aggregator, sec_to_epoch  # noqa: E402
 from thesis_pipeline.dl_data import TestDataRefused  # noqa: E402
 from thesis_pipeline.dl_eval import threshold_f1max  # noqa: E402
@@ -162,6 +162,24 @@ def ds(tmp_path_factory):
     return build_packed_dataset(tmp_path_factory.mktemp("dltrain"))
 
 
+@pytest.fixture(autouse=True)
+def no_freeze_record(tmp_path, monkeypatch):
+    """Hermetic: never read the repository's real freeze record. Trainer tests run as pilots
+    (allow_unfrozen=True) unless they write their own record (``_freeze``)."""
+    monkeypatch.setattr(prereg, "AIM2_DL_FREEZE", tmp_path / "no_freeze_record.json")
+
+
+def _freeze(path: Path, body: str = "# pre-registration (synthetic)\n") -> dict:
+    """Write a note + freeze record pair; returns {note, freeze, body_sha256}."""
+    path.mkdir(parents=True, exist_ok=True)
+    note = path / "prereg.md"
+    note.write_text(body + "\n## Addenda\n")
+    rec = {"note": str(note), "body_sha256": prereg.body_sha256(note), "vault_commit": "a" * 40,
+           "frozen_utc": "2026-10-04T00:00:00Z"}
+    (path / "freeze.json").write_text(json.dumps(rec))
+    return {"note": note, "freeze": path / "freeze.json", "body_sha256": rec["body_sha256"]}
+
+
 @pytest.fixture()
 def tiny_recipe(monkeypatch):
     monkeypatch.setitem(dl_train.RECIPES, "T", dl_train.Recipe("T", 4, 1, 2, 3, 1.0))
@@ -170,7 +188,7 @@ def tiny_recipe(monkeypatch):
 
 def _settings(recipe, **kw):
     base = dict(config="M", model_seed=42, recipe=recipe, amp=False, device="cpu", hidden=8,
-                eval_batch=16, prefetch=2)
+                eval_batch=16, prefetch=2, allow_unfrozen=True)
     base.update(kw)
     return dl_train.TrainSettings(**base)
 
@@ -357,8 +375,129 @@ def test_lr_cut_and_early_stop_pass_numbers(ds, tmp_path, recipe, lrs, stop_afte
     # pass 0 improves; pass k >= 1 is the k-th non-improving pass; the cut takes effect on the next pass
     assert f["lr_cut_on_consecutive_nonimproving_pass"] == lrs.index(1e-4) - 1
     assert f["stop_on_consecutive_nonimproving_pass"] == stop_after - 1
-    assert f["max_passes_at_reduced_lr_before_stop"] == lrs.count(1e-4)
-    assert "4th non-improving pass" in dl_train.SCHEDULE_NOTE and "at most 2 passes" in dl_train.SCHEDULE_NOTE
+    assert f["passes_at_reduced_lr_before_stop_if_no_gain"] == lrs.count(1e-4)
+    assert "4th non-improving pass" in dl_train.SCHEDULE_NOTE and "at most 2 passes" not in dl_train.SCHEDULE_NOTE
+    assert "further x0.1 cuts (no floor)" in dl_train.SCHEDULE_NOTE
+
+
+def test_a_gain_after_the_cut_resets_both_counters(ds, tmp_path):
+    """Recipe A: a gain at the reduced LR resets both counters, so a second x0.1 cut follows
+    (the old 'at most 2 passes at the reduced LR' claim was false)."""
+    t = _trainer(ds, tmp_path, "A")
+    t.train_pass = lambda: None
+    aucs = iter([0.80] * 5 + [0.81] * 20)  # pass 0 improves, 1-4 flat (cut), pass 5 gains, then flat
+
+    def validate():
+        a = next(aucs)
+        return a, {"mean": a, "max": a, "k10": a, "c10": a}
+
+    t.validate = validate
+    while not t.state["done"]:
+        t.train_pass()
+        t.end_pass()
+    lrs = [h["lr"] for h in t.state["history"]]
+    assert lrs == pytest.approx([1e-3] * 5 + [1e-4] * 5 + [1e-5] * 2)
+    assert t.state["stop_reason"].startswith("early stop") and t.state["best_pass"] == 5
+    f = dl_train.schedule_facts(dl_train.RECIPES["A"])
+    assert f["gain_resets_both_counters"] and f["further_cuts_possible"] and f["min_lr"] == 0.0
+
+
+# ---------------------------------------------------------------- pre-registration freeze (training side)
+
+
+def test_run_refuses_without_a_freeze_record(ds, tmp_path, tiny_recipe):
+    t = _trainer(ds, tmp_path, tiny_recipe, allow_unfrozen=False)  # constructing a Trainer is unaffected
+    with pytest.raises(prereg.PreregMismatch, match="production training needs the frozen pre-registration record"):
+        t.run()
+    assert not (tmp_path / "ckpt" / "last.pt").exists()  # refused before anything was read or written
+    r = t.smoke(2)  # smoke needs no freeze record
+    assert r["n_batches"] == 2
+    # a pilot may run without it, and its checkpoints say so
+    assert _trainer(ds, tmp_path / "pilot", tiny_recipe, stop_after_passes=1).run() == "paused"
+    ck = _state(tmp_path / "pilot" / "ckpt" / "last.pt")
+    assert ck["state"]["prereg_freeze_first"] is None and ck["prereg_freeze"] is None
+    assert ck["allow_unfrozen"] is True
+
+
+def test_prereg_freeze_first_survives_resume(ds, tmp_path, tiny_recipe, monkeypatch):
+    a = _freeze(tmp_path / "a", "# body A\n")
+    b = _freeze(tmp_path / "b", "# body B (the freeze record changed mid-run)\n")
+    logs: list[str] = []
+
+    def mk(run, stop, unfrozen=False):
+        return dl_train.Trainer(_settings(tiny_recipe, allow_unfrozen=unfrozen, stop_after_passes=stop),
+                                ds["out"] / "train", ds["out"] / "val", ds["split_json"], tmp_path / run / "ck",
+                                tmp_path / run / "out", log=logs.append)
+
+    monkeypatch.setattr(prereg, "AIM2_DL_FREEZE", a["freeze"])
+    assert mk("r", 1).run() == "paused"
+    ck = _state(tmp_path / "r" / "ck" / "last.pt")
+    assert ck["state"]["prereg_freeze_first"]["body_sha256"] == a["body_sha256"]
+    assert ck["prereg_freeze"]["body_sha256"] == a["body_sha256"] and ck["allow_unfrozen"] is False
+    man = json.loads((ds["out"] / "train" / "MANIFEST.json").read_text())
+    want = {k: man[k] for k in ("frontend_version", "stage_b_version", "edr_method")}
+    assert ck["data_versions"]["train"] == want and set(ck["data_versions"]["val"]) == set(want)
+
+    monkeypatch.setattr(prereg, "AIM2_DL_FREEZE", b["freeze"])
+    assert mk("r", None).run() == "done"
+    assert any("started under frozen body" in m for m in logs)
+    for name in ("last.pt", "best.pt"):
+        assert _state(tmp_path / "r" / "ck" / name)["state"]["prereg_freeze_first"]["body_sha256"] == a["body_sha256"]
+    assert _state(tmp_path / "r" / "ck" / "last.pt")["prereg_freeze"]["body_sha256"] == b["body_sha256"]
+    m = json.loads((tmp_path / "r" / "out" / "metrics.json").read_text())
+    assert m["prereg_freeze_first"]["body_sha256"] == a["body_sha256"]
+    assert m["prereg_freeze"]["body_sha256"] == b["body_sha256"] and m["allow_unfrozen"] is False
+    assert m["stage_b_version"] == want["stage_b_version"] and m["data_versions"]["train"] == want
+
+    # a production invocation refuses to resume a pilot that STARTED unfrozen (the same
+    # ckpt / mirror folders): it could never be reported, so no pass is spent on it
+    monkeypatch.setattr(prereg, "AIM2_DL_FREEZE", tmp_path / "missing.json")
+    assert mk("p", 1, unfrozen=True).run() == "paused"
+    monkeypatch.setattr(prereg, "AIM2_DL_FREEZE", a["freeze"])
+    before = (tmp_path / "p" / "ck" / "last.pt").read_bytes()
+    with pytest.raises(prereg.PreregMismatch, match="did not start under the frozen.*can never be reported"):
+        mk("p", None).run()
+    assert (tmp_path / "p" / "ck" / "last.pt").read_bytes() == before  # no pass ran
+    assert not (tmp_path / "p" / "out" / "metrics.json").exists()
+    # it can still be continued as a pilot, and stays unreportable
+    assert mk("p", None, unfrozen=True).run() == "done"
+    ck = _state(tmp_path / "p" / "ck" / "best.pt")
+    assert ck["state"]["prereg_freeze_first"] is None and ck["allow_unfrozen"] is True
+    m = json.loads((tmp_path / "p" / "out" / "metrics.json").read_text())
+    assert m["prereg_freeze_first"] is None and m["allow_unfrozen"] is True
+
+    # a run that started frozen but was resumed once by a pilot invocation is refused too (sticky flag)
+    assert mk("q", 1).run() == "paused"
+    assert mk("q", 1, unfrozen=True).run() == "paused"
+    assert _state(tmp_path / "q" / "ck" / "last.pt")["state"]["allow_unfrozen_ever"] is True
+    with pytest.raises(prereg.PreregMismatch, match="was resumed by an --allow-unfrozen run"):
+        mk("q", None).run()
+
+
+def test_evaluation_setting_lists_match_run_fields():
+    """evaluate_aim2_dl.py compares SHARED_TRAIN_SETTINGS across runs and refuses PILOT_ONLY_SETTINGS;
+    both must stay in step with TrainSettings.run_fields()."""
+    from thesis_pipeline.dl_eval import PILOT_ONLY_SETTINGS, SHARED_TRAIN_SETTINGS
+    rf = set(dl_train.TrainSettings(config="M", model_seed=42).run_fields())
+    assert set(SHARED_TRAIN_SETTINGS) == rf - {"config", "model_seed", "amp"}
+    assert set(PILOT_ONLY_SETTINGS) <= rf
+    assert all(getattr(dl_train.TrainSettings(config="M", model_seed=42), k) is None for k in PILOT_ONLY_SETTINGS)
+
+
+def test_score_split_returns_row_aligned_seconds(ds):
+    from thesis_pipeline.dl_aggregate import AGGREGATORS
+    from thesis_pipeline.dl_data import PackedSplit
+
+    torch.manual_seed(0)
+    ps = PackedSplit(ds["out"] / "val", dl_train.CONFIGS["M"])
+    model = dl_train.build_model(dl_train.CONFIGS["M"], hidden=8)
+    cpu = torch.device("cpu")
+    df = dl_train.score_split(model, ps, cpu, False, batch=16)
+    df2, sec = dl_train.score_split(model, ps, cpu, False, batch=16, return_seconds=True)
+    pd.testing.assert_frame_equal(df, df2)
+    assert sec.dtype == np.float32 and sec.shape == (len(df), 30) and sec.flags["C_CONTIGUOUS"]
+    for r in AGGREGATORS:
+        np.testing.assert_allclose(sec_to_epoch(sec, r), df[f"p_{r}"].to_numpy(), rtol=0, atol=1e-7)
 
 
 def test_nonfinite_steps_are_skipped_without_amp(ds, tmp_path, tiny_recipe):
@@ -390,6 +529,110 @@ def test_nonfinite_steps_are_skipped_without_amp(ds, tmp_path, tiny_recipe):
     with pytest.raises(FloatingPointError, match="not written"):
         t._save("last.pt", t._payload())
     assert (tmp_path / "ckpt" / "last.pt").read_bytes() == before
+
+
+def test_gradscaler_skipped_steps_are_counted_and_trigger_nothing(ds, tmp_path, tiny_recipe):
+    """AMP: steps the GradScaler skips (overflowing scaled gradients, finite loss) are counted in
+    ``scaler_skipped`` (reported in history.csv / metrics.json), not as non-finite losses. They are
+    non-finite training steps for the consecutive count, which the next applied step resets, so a
+    few in a row trigger nothing (20 in a row do: the next test)."""
+    t = _trainer(ds, tmp_path, tiny_recipe)
+    t.amp = True  # CPU autocast + a GradScaler whose scale overflows every scaled gradient
+    t.scaler = torch.amp.GradScaler("cpu", init_scale=2.0 ** 120)
+    before = [p.detach().clone() for p in t.model.parameters()]
+    t.train_pass()
+    st = t.state
+    assert st["scaler_skipped"] == 3 and st["nonfinite"] == 0 and st["consec_nonfinite"] == 3
+    assert all(torch.equal(a, b) for a, b in zip(before, t.model.parameters()))  # every step was skipped
+    t.amp = False  # validate in fp32
+    t.end_pass()
+    assert st["history"][-1]["scaler_skipped_total"] == 3 and st["history"][-1]["nonfinite_total"] == 0
+    hist = pd.read_csv(tmp_path / "out" / "history.csv")
+    assert hist["scaler_skipped_total"].tolist() == [3]
+    t.amp, t.scaler = True, torch.amp.GradScaler("cpu", init_scale=1.0)
+    t.train_pass()  # a sane scale: no further skips, the weights move
+    assert st["scaler_skipped"] == 3 and not all(torch.equal(a, b) for a, b in zip(before, t.model.parameters()))
+    assert st["consec_nonfinite"] == 0  # reset by the first applied step
+
+
+@pytest.mark.parametrize("amp", [True, False])
+def test_twenty_consecutive_nonfinite_steps_raise_the_nan_fallback(ds, tmp_path, tiny_recipe, amp):
+    """The same pathology (finite loss, NaN gradients on every step) raises the NaN fallback after 20
+    steps with AMP (the GradScaler skips each step) exactly as without it (the fp32 check skips
+    each step), instead of stalling an AMP run with frozen weights until early stopping."""
+    t = _trainer(ds, tmp_path, tiny_recipe)
+    if amp:
+        t.amp, t.scaler = True, torch.amp.GradScaler("cpu")  # a sane scale: only the hook breaks the gradients
+    t.model.fc2.weight.register_hook(lambda g: torch.full_like(g, float("nan")))
+    before = [p.detach().clone() for p in t.model.parameters()]
+    with pytest.raises(FloatingPointError, match="20 consecutive non-finite training steps"):
+        for _ in range(10):  # 3 steps per pass of the tiny recipe
+            t.state["step_in_pass"] = 0
+            t.train_pass()
+    st = t.state
+    assert st["consec_nonfinite"] == 20
+    assert (st["scaler_skipped"], st["nonfinite"]) == ((20, 0) if amp else (0, 20))  # totals stay separate
+    assert all(torch.equal(a, b) for a, b in zip(before, t.model.parameters()))  # no step was applied
+
+
+def test_every_invocation_records_its_commit(ds, tmp_path, tiny_recipe, monkeypatch):
+    """A run paused at commit A and resumed at B (then A again) lists [A, B] in every later
+    checkpoint and in metrics.json; ``git_commit`` alone would show only the last invocation."""
+    a, b = "a" * 40, "b" * 40
+    monkeypatch.setattr(dl_train, "git_commit", lambda: a)
+    assert _trainer(ds, tmp_path, tiny_recipe, stop_after_passes=1).run() == "paused"
+    assert _state(tmp_path / "ckpt" / "last.pt")["state"]["git_commits"] == [a]
+    monkeypatch.setattr(dl_train, "git_commit", lambda: b)
+    assert _trainer(ds, tmp_path, tiny_recipe, stop_after_passes=1).run() == "paused"
+    last = _state(tmp_path / "ckpt" / "last.pt")
+    assert last["state"]["git_commits"] == [a, b] == last["git_commits"] and last["git_commit"] == b
+    monkeypatch.setattr(dl_train, "git_commit", lambda: a)  # back at A: listed once
+    assert _trainer(ds, tmp_path, tiny_recipe).run() == "done"
+    last = _state(tmp_path / "ckpt" / "last.pt")
+    assert last["state"]["git_commits"] == [a, b] == last["git_commits"] and last["git_commit"] == a
+    m = json.loads((tmp_path / "out" / "metrics.json").read_text())
+    assert m["git_commits"] == [a, b] and m["git_commit"] == a
+    # a checkpoint written before the history existed is seeded with the commit that saved it
+    old = tmp_path / "old"
+    assert _trainer(ds, old, tiny_recipe, stop_after_passes=1).run() == "paused"
+    ck = _state(old / "ckpt" / "last.pt")
+    del ck["state"]["git_commits"]
+    torch.save(ck, old / "ckpt" / "last.pt")
+    monkeypatch.setattr(dl_train, "git_commit", lambda: b)
+    assert _trainer(ds, old, tiny_recipe, stop_after_passes=1).run() == "paused"
+    assert _state(old / "ckpt" / "last.pt")["state"]["git_commits"] == [a, b]
+
+
+def test_a_refinalise_records_its_commit_and_pilot_flag_in_last_pt(ds, tmp_path, tiny_recipe, monkeypatch):
+    """An invocation that only re-finalises a finished run (no pass; notebook cell 9) records a new
+    commit or a first --allow-unfrozen in last.pt before finalising (same weights, optimiser and RNG
+    states), so a later re-finalise cannot erase it from metrics.json."""
+    c, x = "c" * 40, "d" * 40
+    fz = _freeze(tmp_path / "fz")
+    monkeypatch.setattr(prereg, "AIM2_DL_FREEZE", fz["freeze"])
+    last, best, metrics = tmp_path / "ckpt" / "last.pt", tmp_path / "ckpt" / "best.pt", tmp_path / "out" / "metrics.json"
+
+    def run(commit: str, unfrozen: bool = False) -> str:
+        monkeypatch.setattr(dl_train, "git_commit", lambda: commit)
+        return _trainer(ds, tmp_path, tiny_recipe, allow_unfrozen=unfrozen).run()
+
+    assert run(c) == "done"
+    first, best_bytes, last_bytes = _state(last), best.read_bytes(), last.read_bytes()
+    assert run(c) == "done" and last.read_bytes() == last_bytes  # same commit, no pilot flag: nothing re-saved
+    assert run(x) == "done"  # a production re-finalise at another commit
+    ck = _state(last)
+    assert ck["state"]["git_commits"] == [c, x] == ck["git_commits"] and ck["git_commit"] == x
+    for k in ("model", "best_model"):
+        assert all(torch.equal(ck[k][n], first[k][n]) for n in first[k])
+    assert torch.equal(ck["rng"]["torch"], first["rng"]["torch"]) and ck["state"]["done"] is True
+    assert best.read_bytes() == best_bytes  # best.pt is rewritten only when stale
+    assert run(c) == "done" and json.loads(metrics.read_text())["git_commits"] == [c, x]  # not erased
+    # a pilot re-finalise is recorded too: the run can never be continued or re-finalised as production
+    assert run(c, unfrozen=True) == "done"
+    assert _state(last)["state"]["allow_unfrozen_ever"] is True and _state(last)["allow_unfrozen"] is True
+    with pytest.raises(prereg.PreregMismatch, match="was resumed by an --allow-unfrozen run"):
+        run(c)
+    assert json.loads(metrics.read_text())["allow_unfrozen"] is True
 
 
 def test_mirror_io_errors_are_retried_not_fatal(ds, tmp_path, tiny_recipe, monkeypatch):
@@ -435,7 +678,7 @@ def test_smoke_reports_loss_trend(ds, tmp_path, tiny_recipe):
 # ---------------------------------------------------------------- predict / evaluate CLIs (validation only)
 
 
-def test_predict_val_and_evaluate_val_cli(ds, tmp_path, tiny_recipe):
+def test_predict_val_and_evaluate_val_cli(ds, tmp_path, tiny_recipe, monkeypatch):
     from click.testing import CliRunner
 
     import evaluate_aim2_dl
@@ -445,27 +688,42 @@ def test_predict_val_and_evaluate_val_cli(ds, tmp_path, tiny_recipe):
     t = dl_train.Trainer(_settings(tiny_recipe), ds["out"] / "train", ds["out"] / "val", ds["split_json"],
                          tmp_path / "ckpt", run_dir, log=lambda *a: None)
     t.run()
-    prereg = tmp_path / "prereg.md"
-    prereg.write_text("# pre-registration (test)\n")
+    fz = _freeze(tmp_path / "prereg")  # predict checks the note's body against the freeze record
+    monkeypatch.setattr(prereg, "AIM2_DL_FREEZE", fz["freeze"])
+    monkeypatch.setattr(predict_aim2_dl, "PREREG_EVAL_BATCH", 16)  # the training eval batch: identical predictions
+    note = fz["note"]
+    pp = json.loads((run_dir / "postproc.json").read_text())
+    lock = tmp_path / "AGGREGATOR_LOCK.json"
+    lock.write_text(json.dumps({"aggregator": pp["aggregator"], "rule": pp["aggregator_rule"],
+                                "from": str(run_dir / "postproc.json"), "best_ckpt_sha256": pp["best_ckpt_sha256"]}))
     runner = CliRunner()
     base = ["--ckpt", str(tmp_path / "ckpt" / "best.pt"), "--postproc", str(run_dir / "postproc.json"),
-            "--prereg", str(prereg), "--out-dir", str(tmp_path / "pred"), "--split-json", str(ds["split_json"]),
+            "--prereg", str(note), "--out-dir", str(tmp_path / "pred"), "--split-json", str(ds["split_json"]),
             "--device", "cpu", "--no-amp", "--eval-batch", "16"]
     r = runner.invoke(predict_aim2_dl.main, base + ["--data-dir", str(ds["out"] / "val"), "--split", "val",
-                                                    "--refit-postproc"], catch_exceptions=False)
+                                                    "--refit-postproc"])
+    assert r.exit_code != 0 and "--refit-postproc requires --aggregator-lock" in r.output
+    r = runner.invoke(predict_aim2_dl.main, base + ["--data-dir", str(ds["out"] / "val"), "--split", "val",
+                                                    "--refit-postproc", "--aggregator-lock", str(lock)],
+                      catch_exceptions=False)
     assert r.exit_code == 0, r.output
     re_pred = pd.read_parquet(tmp_path / "pred" / "val_predictions_cpu.parquet")
     trained = pd.read_parquet(run_dir / "val_predictions.parquet")
     assert np.array_equal(re_pred["pred_prob"].to_numpy(), trained["pred_prob"].to_numpy())
     prov = json.loads((tmp_path / "pred" / "predict_val_cpu.json").read_text())
-    assert len(prov["prereg_sha256"]) == 64 and (tmp_path / "pred" / "postproc_cpu.json").exists()
+    assert len(prov["prereg_sha256"]) == 64 and prov["prereg_body_sha256"] == fz["body_sha256"]
+    assert prov["parity"]["passed"] and prov["parity"]["abs_diff"] == 0.0  # same device + precision as training
+    new_pp = json.loads((tmp_path / "pred" / "postproc_cpu.json").read_text())
+    assert new_pp["parity"] == prov["parity"]
+    sec = np.load(tmp_path / "pred" / "val_sec_probs_cpu.npy")
+    assert sec.shape == (len(re_pred), 30) and sec.dtype == np.float32
 
     # the test path is refused without a freeze tag, and a test folder cannot be read as val
     r = runner.invoke(predict_aim2_dl.main, base + ["--data-dir", str(ds["out"] / "test"), "--split", "test"])
     assert r.exit_code != 0 and "freeze-tag" in r.output
     r = runner.invoke(predict_aim2_dl.main, base + ["--data-dir", str(ds["out"] / "test"), "--split", "val"])
     assert r.exit_code != 0 and isinstance(r.exception, TestDataRefused)
-    r = runner.invoke(predict_aim2_dl.main, [a for a in base if a not in ("--prereg", str(prereg))]
+    r = runner.invoke(predict_aim2_dl.main, [a for a in base if a not in ("--prereg", str(note))]
                       + ["--data-dir", str(ds["out"] / "val"), "--split", "val"])
     assert r.exit_code != 0 and "prereg" in r.output
 
@@ -488,7 +746,8 @@ def test_predict_val_and_evaluate_val_cli(ds, tmp_path, tiny_recipe):
     assert r.exit_code == 0, r.output
     summ = json.loads((tmp_path / "runs" / "evaluation_summary_val.json").read_text())
     c = summ["configs"]["M"]["contrasts"]["lgbm"]
-    assert c["claim_rule_auc"]["verdict"].startswith("insufficient")  # one seed only
+    assert c["claim_rule_auc"]["verdict"] is None  # one seed only: no verdict (spec A1)
+    assert c["claim_rule_auc"]["label"].startswith("no verdict: fewer than 3 seeds")
     me = json.loads((run_dir / "val_eval" / "metrics_extended.json").read_text())
     assert me["n_subjects_with_nsrr_ahi"] == 2
     assert not (run_dir / "metrics_extended.json").exists()  # val metrics kept apart from test outputs
